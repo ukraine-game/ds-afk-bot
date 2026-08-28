@@ -2120,7 +2120,144 @@ async def open_cases_and_send(interaction: discord.Interaction, rarity: str, qua
         )
 
 
-@bot.tree.command(name="inventory", description="Переглянути свій інвентар")
+class InventoryUseView(discord.ui.View):
+    """Interactive inventory: select an item and use it.
+
+    Cases are consumed and opened immediately. Cars/houses are equipped as the
+    active profile property. All mutations are persisted in SQLite.
+    """
+    def __init__(self, user_id: int, rows):
+        super().__init__(timeout=300)
+        self.user_id = user_id
+        self.rows = rows
+        options = []
+        for idx, r in enumerate(rows[:25]):
+            item_type = r["item_type"]
+            if item_type == "case":
+                emoji = CASE_DATA.get(r["item_key"], {}).get("emoji", "🎁")
+                label = f"{emoji} Кейс: {r['item_key']}"
+                description = f"Кількість: {r['quantity']} • відкривається"
+            elif item_type == "car":
+                label = f"🚗 {r['item_key']}"
+                description = f"Кількість: {r['quantity']} • зробити активним"
+            elif item_type == "house":
+                label = f"🏠 {r['item_key']}"
+                description = f"Кількість: {r['quantity']} • зробити основним"
+            else:
+                label = f"📦 {r['item_key']}"
+                description = f"Кількість: {r['quantity']}"
+            options.append(discord.SelectOption(
+                label=label[:100], description=description[:100], value=str(idx)
+            ))
+
+        if options:
+            select = discord.ui.Select(
+                placeholder="Обери предмет, який хочеш використати",
+                options=options,
+                custom_id=f"inventory_use_{user_id}"
+            )
+            select.callback = self.use_selected
+            self.add_item(select)
+
+    async def interaction_check(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                "❌ Це меню інвентарю належить іншому користувачу.", ephemeral=True
+            )
+            return False
+        return True
+
+    async def use_selected(self, interaction: discord.Interaction):
+        select = self.children[0]
+        index = int(select.values[0])
+        if index >= len(self.rows):
+            return await interaction.response.send_message(
+                "❌ Цей предмет більше недоступний. Відкрий `/inventory` ще раз.", ephemeral=True
+            )
+
+        row = self.rows[index]
+        item_type = row["item_type"]
+        item_key = row["item_key"]
+
+        # Re-check the database at click time to prevent stale menus and
+        # double-spending an item after another interaction.
+        fresh = find_inventory_item(self.user_id, item_type, item_key)
+        if not fresh:
+            return await interaction.response.send_message(
+                "❌ Цього предмета вже немає в інвентарі. Онови `/inventory`.", ephemeral=True
+            )
+
+        if item_type == "case":
+            if item_key not in CASE_DATA:
+                return await interaction.response.send_message(
+                    "❌ Невідомий тип кейса. Звернися до адміністратора.", ephemeral=True
+                )
+            if not remove_inventory_item(self.user_id, "case", item_key, 1):
+                return await interaction.response.send_message(
+                    "❌ Не вдалося використати кейс. Спробуй ще раз.", ephemeral=True
+                )
+
+            for child in self.children:
+                child.disabled = True
+            await interaction.response.edit_message(
+                embed=embed(
+                    "🎁 Відкриваємо кейс",
+                    f"{CASE_DATA[item_key]['emoji']} **{item_key}** використано з інвентарю.\n\n"
+                    "Зараз визначимо твою машину...",
+                    discord.Color.gold()
+                ),
+                view=self
+            )
+            name, value, jackpot, chance = roll_case(item_key)
+            title = "🎰 ДЖЕКПОТ!" if jackpot else "🎁 Кейс відкрито"
+            text = (
+                f"{CASE_DATA[item_key]['emoji']} Рідкість кейса: **{item_key}**\n\n"
+                f"🚗 Ви отримали: **{name}**\n"
+                f"💰 Вартість машини: **{money(value)}**"
+            )
+            if jackpot:
+                text += "\n\n🎰 **ЦЕ ДЖЕКПОТ! Вітаємо!**"
+            await interaction.followup.send(
+                embed=embed(title, text, discord.Color.gold() if jackpot else discord.Color.blurple()),
+                view=CarResultView(self.user_id, name, value),
+                ephemeral=True
+            )
+            return
+
+        if item_type == "car":
+            conn = db()
+            conn.execute("UPDATE users SET active_car=? WHERE user_id=?", (item_key, self.user_id))
+            conn.commit(); conn.close()
+            await interaction.response.send_message(
+                embed=embed(
+                    "🚗 Автомобіль використано",
+                    f"Тепер твій активний автомобіль: **{item_key}**.\n\n"
+                    "Це також відображатиметься у `/profile`.",
+                    discord.Color.green()
+                ), ephemeral=True
+            )
+            return
+
+        if item_type == "house":
+            conn = db()
+            conn.execute("UPDATE users SET primary_house=? WHERE user_id=?", (item_key, self.user_id))
+            conn.commit(); conn.close()
+            await interaction.response.send_message(
+                embed=embed(
+                    "🏠 Нерухомість використано",
+                    f"Тепер твій основний дім: **{item_key}**.\n\n"
+                    "Це також відображатиметься у `/profile`.",
+                    discord.Color.green()
+                ), ephemeral=True
+            )
+            return
+
+        await interaction.response.send_message(
+            "ℹ️ Для цього предмета поки немає дії використання.", ephemeral=True
+        )
+
+
+@bot.tree.command(name="inventory", description="Переглянути та використовувати предмети інвентарю")
 async def inventory(interaction: discord.Interaction):
     if not normal_channel_only(interaction):
         return await reject_wrong_channel(interaction)
@@ -2129,18 +2266,23 @@ async def inventory(interaction: discord.Interaction):
     parts = []
     for r in rows:
         if r["item_type"] == "case":
-            label = f"{CASE_DATA.get(r['item_key'], {'emoji':'🎁'})['emoji']} Кейси: **{r['item_key']}** — {r['quantity']} шт."
+            label = f"{CASE_DATA.get(r['item_key'], {'emoji':'🎁'})['emoji']} Кейси: **{r['item_key']}** — {r['quantity']} шт. • 🎁 можна відкрити"
         elif r["item_type"] == "car":
-            label = f"🚗 **{r['item_key']}** — {r['quantity']} шт."
+            label = f"🚗 **{r['item_key']}** — {r['quantity']} шт. • ⚙️ можна використати"
         elif r["item_type"] == "house":
-            label = f"🏠 **{r['item_key']}** — {r['quantity']} шт."
+            label = f"🏠 **{r['item_key']}** — {r['quantity']} шт. • ⚙️ можна використати"
         else:
             label = f"📦 **{r['item_key']}** — {r['quantity']} шт."
         parts.append(label)
     if role_rows:
         parts.append("🏷️ Ролі: " + ", ".join(f"**{r['name']}**" for r in role_rows))
     description = "\n".join(parts) if parts else "Твій інвентар порожній."
-    await interaction.response.send_message(embed=embed("🎒 Інвентар", description, discord.Color.blurple()), ephemeral=True)
+    description += "\n\n👇 **Обери предмет нижче, щоб використати його.**" if rows else ""
+    await interaction.response.send_message(
+        embed=embed("🎒 Інвентар", description, discord.Color.blurple()),
+        view=InventoryUseView(interaction.user.id, rows) if rows else None,
+        ephemeral=True
+    )
 
 # ---------------- HOUSES ----------------
 class HouseShopView(discord.ui.View):
