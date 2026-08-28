@@ -175,3 +175,11 @@ bot.db
 ```
 
 поруч із `bot.py`.
+
+
+## New in this build
+- `/roulette` asks for the bet first, then the number. It no longer bets the whole balance.
+- Coinflip uses an unbiased `random.choice(("Орел", "Решка"))` 50/50 result when no one-shot admin override is active.
+- Coinflip admin rig is a one-shot global override: the first next coinflip by any user consumes it atomically.
+- Admin panel has a private `🗄️ База даних` button that shows saved users, balances, sizes, promo codes/usages, roles, settings and cookie-game records.
+- Persistent Railway database and verified automatic backups remain enabled.

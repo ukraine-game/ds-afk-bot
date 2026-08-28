@@ -20,6 +20,13 @@ DAILY_REWARD = 50_000
 ROLE_CREATE_COST = 200_000
 ROLE_ADMIN_ID = 1542839885055004672
 OWNER_ID = 1455564327351226380
+
+# Discord CDN emoji links used by the server's embeds.
+EMOJI_DICK = "https://discord.com/assets/d59af318cacdcf3b.svg"
+EMOJI_GROWTH = "https://discord.com/assets/a59b48874be63ed4.svg"
+EMOJI_GIFT = "https://discord.com/assets/949f113339307625.svg"
+EMOJI_MONEY = "https://discord.com/assets/60e4658040396168.svg"
+
 MIN_COINFLIP_BET = 100
 MIN_COOKIE_BET = 1_000
 MAX_BET = 2_000_000_000
@@ -482,6 +489,23 @@ def delete_setting(key: str):
     conn.close()
 
 
+def consume_setting(key: str):
+    """Atomically read-and-delete a one-shot setting."""
+    conn = db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT value FROM bot_settings WHERE key=?", (key,)).fetchone()
+        if row:
+            conn.execute("DELETE FROM bot_settings WHERE key=?", (key,))
+        conn.commit()
+        return row["value"] if row else None
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def normal_channel_only(interaction: discord.Interaction) -> bool:
     return interaction.channel_id == NORMAL_CHANNEL_ID
 
@@ -533,8 +557,9 @@ async def dick(interaction: discord.Interaction):
     action = "виріс" if change > 0 else ("зменшився" if change < 0 else "не змінився")
     await interaction.response.send_message(embed=embed(
         "🍆 Розмір пісюна",
-        f"📈 Твій пісюн **{action}** на **{sign} см**!\n\n"
-        f"Тепер його розмір: **{new_size} см** 🍆.",
+        f"[**🍆**]({EMOJI_DICK}) **Розмір пісюна**\n\n"
+        f"[📈]({EMOJI_GROWTH}) Твій пісюн **{action}** на **{sign} см**!\n"
+        f"Тепер його розмір: **{new_size} см** [🍆]({EMOJI_DICK}).",
         discord.Color.green() if change >= 0 else discord.Color.red(),
     ))
 
@@ -613,7 +638,9 @@ async def daily(interaction: discord.Interaction):
     money_add(interaction.user.id, DAILY_REWARD)
     set_cooldown(interaction.user.id, "daily_at")
     await interaction.response.send_message(embed=embed(
-        "🎁 Щоденний бонус", f"🎁 Ти отримав `{money(DAILY_REWARD)}` 💰!", discord.Color.gold()
+         "🎁 Щоденний бонус",
+        f"[🎁]({EMOJI_GIFT}) Ти отримав `{money(DAILY_REWARD)}` [💰]({EMOJI_MONEY})!",
+        discord.Color.gold()
     ))
 
 
@@ -721,32 +748,34 @@ class CoinChoiceView(discord.ui.View):
         self.disable_buttons()
         # This selection message is private: only the player can see it.
         await interaction.response.edit_message(
-            embed=embed("Монетка", "Бот підкидає монетку..."),
+            embed=embed("🪙 Підкинув монетку...", "⏳ Результат буде через 2 секунди..."),
             view=self,
         )
         try:
             await asyncio.sleep(2)
-            forced = get_setting("coinflip_next")
+            # Exactly 50/50 when there is no one-shot admin override.
+            # The override is atomically consumed, so only the FIRST next spin
+            # by ANY user can receive it.
+            forced = consume_setting("coinflip_next")
             if forced in ("Орел", "Решка"):
                 result = forced
-                delete_setting("coinflip_next")
             else:
-                result = random.choice(["Орел", "Решка"])
+                result = random.choice(("Орел", "Решка"))
 
             won = result == self.choice
             if won:
                 winnings = self.bet * 2
                 money_add(self.owner_id, winnings)
                 text = (
-                    f"🪙 Випало: **{result}**! 🎉\n"
-                    f"Ти вгадав! Отримуєш **{money(winnings)}** 💰."
+                    f"[🪙]({EMOJI_MONEY}) Випало: **{result}**! 🎉\n"
+                    f"Ти вгадав! Отримуєш **{money(winnings)}** [💰]({EMOJI_MONEY})."
                 )
                 title = "🪙 Coinflip"
                 color = discord.Color.green()
             else:
                 text = (
                     f"🪙 Випало: **{result}**! ❌\n"
-                    f"Ти програв ставку **{money(self.bet)}** 💰."
+                    f"Ти програв ставку **{money(self.bet)}** [💰]({EMOJI_MONEY})."
                 )
                 title = "🪙 Coinflip"
                 color = discord.Color.red()
@@ -777,7 +806,7 @@ async def coinflip(interaction: discord.Interaction, bet: app_commands.Range[int
         return await interaction.response.send_message(f"❌ Недостатньо грошей. Баланс: **{money(u['balance'])}**.", ephemeral=True)
     money_add(interaction.user.id, -bet)
     await interaction.response.send_message(
-        embed=embed("🪙 Coinflip", f"Ставка: **{money(bet)}**\n\nОбери сторону монетки."),
+        embed=embed("🪙 Coinflip", f"💰 Ставка: **{money(bet)}**\n\n🦅 **Орел** або 🪙 **Решка**?"),
         view=CoinChoiceView(interaction.user.id, bet),
         ephemeral=True,
     )
@@ -785,23 +814,170 @@ async def coinflip(interaction: discord.Interaction, bet: app_commands.Range[int
 
 # ---------------- ROULETTE ----------------
 
-@bot.tree.command(name="roulette", description="Спробувати вгадати випадкове число та примножити баланс")
+@bot.tree.command(name="roulette", description="Ставка та спроба вгадати число")
 async def roulette(interaction: discord.Interaction):
     if not normal_channel_only(interaction):
         return await reject_wrong_channel(interaction)
     await interaction.response.send_message(
         embed=embed(
-            "Рулетка",
-            "Бот загадає випадкове число. Якщо ти вгадаєш його, ставка помножиться на коефіцієнт. Якщо ні — ставка буде програна.\n\n"
-            "**Рівні складності:**\n"
-            "Легкий: від 1 до 3 — коефіцієнт X3\n"
-            "Середній: від 1 до 5 — коефіцієнт X5\n"
-            "Важкий: від 1 до 10 — коефіцієнт X10\n"
-            "Неможливий: від 1 до 50 — коефіцієнт X1000\n\n"
-            "Спочатку обери рівень складності."
+            "🎰 Рулетка",
+            "Спочатку обери рівень, потім бот попросить **суму ставки**, і лише після цього — твоє число.\n\n"
+            "🟢 **Легкий:** 1–3 — X3\n"
+            "🔵 **Середній:** 1–5 — X5\n"
+            "🔴 **Важкий:** 1–10 — X10\n"
+            "🟣 **Неможливий:** 1–50 — X1000\n\n"
+            "💰 Мінімальна ставка: **100**."
         ),
         view=RouletteDifficultyView()
     )
+
+
+class RouletteBetModal(discord.ui.Modal, title="💰 Сума ставки"):
+    bet = discord.ui.TextInput(
+        label="Сума ставки",
+        placeholder="Наприклад: 5000",
+        required=True,
+        max_length=15
+    )
+
+    def __init__(self, low: int, high: int, multiplier: int, label: str):
+        super().__init__()
+        self.low = low
+        self.high = high
+        self.multiplier = multiplier
+        self.level_label = label
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not normal_channel_only(interaction):
+            return await reject_wrong_channel(interaction)
+
+        try:
+            amount = int(str(self.bet.value).strip())
+        except ValueError:
+            return await interaction.response.send_message(
+                "❌ Сума ставки має бути цілим числом.", ephemeral=True
+            )
+
+        if amount < MIN_COINFLIP_BET:
+            return await interaction.response.send_message(
+                f"❌ Мінімальна ставка — **{money(MIN_COINFLIP_BET)}** 💰.",
+                ephemeral=True
+            )
+        if amount > MAX_BET:
+            return await interaction.response.send_message("❌ Ставка занадто велика.", ephemeral=True)
+
+        u = get_user(interaction.user.id, interaction.user.name)
+        if u["balance"] < amount:
+            return await interaction.response.send_message(
+                f"❌ Недостатньо грошей. Твій баланс: **{money(u['balance'])}** 💰.",
+                ephemeral=True
+            )
+
+        # Reserve the stake atomically before asking for the number.
+        if not money_add(interaction.user.id, -amount):
+            return await interaction.response.send_message(
+                "❌ Не вдалося зарезервувати ставку. Спробуй ще раз.",
+                ephemeral=True
+            )
+
+        await interaction.response.send_modal(
+            RouletteGuessModal(
+                interaction.user.id,
+                amount,
+                self.low,
+                self.high,
+                self.multiplier,
+                self.level_label
+            )
+        )
+
+
+class RouletteGuessModal(discord.ui.Modal, title="🎯 Твоє число"):
+    guess = discord.ui.TextInput(
+        label="Обери число",
+        placeholder="Введи число з діапазону",
+        required=True,
+        max_length=3
+    )
+
+    def __init__(self, owner_id: int, bet: int, low: int, high: int, multiplier: int, label: str):
+        super().__init__()
+        self.owner_id = owner_id
+        self.bet_amount = bet
+        self.low = low
+        self.high = high
+        self.multiplier = multiplier
+        self.level_label = label
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if interaction.user.id != self.owner_id:
+            # Normally impossible because the modal is tied to the interaction,
+            # but keep the check as a safety guard.
+            money_add(self.owner_id, self.bet_amount)
+            return await interaction.response.send_message("❌ Це не твоя ставка.", ephemeral=True)
+
+        try:
+            number = int(str(self.guess.value).strip())
+        except ValueError:
+            money_add(self.owner_id, self.bet_amount)
+            return await interaction.response.send_message(
+                "❌ Потрібно ввести ціле число. Ставку повернено.", ephemeral=True
+            )
+
+        if not self.low <= number <= self.high:
+            money_add(self.owner_id, self.bet_amount)
+            return await interaction.response.send_message(
+                f"❌ Число має бути від **{self.low}** до **{self.high}**. Ставку повернено.",
+                ephemeral=True
+            )
+
+        await interaction.response.send_message(
+            embed=embed(
+                "🎰 Рулетка",
+                f"💰 Ставка: **{money(self.bet_amount)}**\n"
+                f"🎯 Твоє число: **{number}**\n\n"
+                "⏳ Бот думає над результатом..."
+            ),
+            ephemeral=True
+        )
+
+        await asyncio.sleep(2)
+
+        forced = consume_setting("roulette_next")
+        forced_number = None
+        if forced is not None:
+            try:
+                candidate = int(forced)
+                if self.low <= candidate <= self.high:
+                    forced_number = candidate
+            except ValueError:
+                pass
+
+        result = forced_number if forced_number is not None else random.randint(self.low, self.high)
+
+        if result == number:
+            winnings = self.bet_amount * self.multiplier
+            money_add(self.owner_id, winnings)
+            desc = (
+                f"🎯 Випало число: **{result}**!\n\n"
+                f"🎉 **Ти вгадав!**\n"
+                f"💰 Ставка: **{money(self.bet_amount)}**\n"
+                f"💵 Виплата: **{money(winnings)}**\n"
+                f"📈 Коефіцієнт: **X{self.multiplier}**"
+            )
+            color = discord.Color.green()
+        else:
+            desc = (
+                f"🎯 Випало число: **{result}**!\n\n"
+                f"❌ **Ти не вгадав.**\n"
+                f"💸 Втрачено: **{money(self.bet_amount)}**"
+            )
+            color = discord.Color.red()
+
+        await interaction.edit_original_response(
+            embed=embed("🎰 Результат рулетки", desc, color)
+        )
+
 
 class RouletteDifficultyView(discord.ui.View):
     def __init__(self):
@@ -810,85 +986,31 @@ class RouletteDifficultyView(discord.ui.View):
     async def choose(self, interaction: discord.Interaction, low: int, high: int, multiplier: int, label: str):
         if not normal_channel_only(interaction):
             return await reject_wrong_channel(interaction)
-        u = get_user(interaction.user.id, interaction.user.name)
-        if u["balance"] <= 0:
-            return await interaction.response.send_message("Недостатньо грошей. Потрібен позитивний баланс.", ephemeral=True)
 
-        await interaction.response.send_message(
-            embed=embed(
-                "Рулетка",
-                f"Ти обрав рівень **{label}**.\nЗагадай число від **{low}** до **{high}** і напиши його нижче одним повідомленням.",
-            ),
-            ephemeral=True
+        u = get_user(interaction.user.id, interaction.user.name)
+        if u["balance"] < MIN_COINFLIP_BET:
+            return await interaction.response.send_message(
+                f"❌ Для гри потрібно хоча б **{money(MIN_COINFLIP_BET)}** 💰.",
+                ephemeral=True
+            )
+
+        await interaction.response.send_modal(
+            RouletteBetModal(low, high, multiplier, label)
         )
 
-        def check(m: discord.Message):
-            return m.author.id == interaction.user.id and m.channel.id == interaction.channel_id
-
-        try:
-            msg = await bot.wait_for("message", timeout=60, check=check)
-            guess = int(msg.content.strip())
-            if not low <= guess <= high:
-                return await interaction.followup.send(f"Число має бути від {low} до {high}.", ephemeral=True)
-        except (asyncio.TimeoutError):
-            return await interaction.followup.send("Час на відповідь вичерпано.", ephemeral=True)
-        except ValueError:
-            return await interaction.followup.send("Потрібно написати число.", ephemeral=True)
-
-        # Ставка дорівнює всьому поточному балансу користувача.
-        u = get_user(interaction.user.id, interaction.user.name)
-        bet = u["balance"]
-        money_add(interaction.user.id, -bet)
-        await interaction.followup.send(embed=embed("Рулетка", "Бот думає над числом..."))
-
-        await asyncio.sleep(2)
-        forced = get_setting("roulette_next")
-        if forced is not None:
-            try:
-                forced_number = int(forced)
-            except ValueError:
-                forced_number = None
-            if forced_number is not None and low <= forced_number <= high:
-                result = forced_number
-            else:
-                result = random.randint(low, high)
-            delete_setting("roulette_next")
-        else:
-            result = random.randint(low, high)
-
-        if result == guess:
-            winnings = bet * multiplier
-            money_add(interaction.user.id, winnings)
-            desc = (
-                f"Число **{result}**!\n\n"
-                f"Вітаю, ти вгадав!\n"
-                f"Твоя ставка **{money(bet)}** перетворилась на **{money(winnings)}**.\n"
-                f"Коефіцієнт: **X{multiplier}**."
-            )
-            color = discord.Color.green()
-        else:
-            desc = (
-                f"Число **{result}**!\n\n"
-                f"На жаль, ти не вгадав.\n"
-                f"Ти програв **{money(bet)}**."
-            )
-            color = discord.Color.red()
-
-        await interaction.followup.send(embed=embed("Результат рулетки", desc, color))
-
-    @discord.ui.button(label="Легкий", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="Легкий", emoji="🟢", style=discord.ButtonStyle.success)
     async def easy(self, interaction, button):
         await self.choose(interaction, 1, 3, 3, "Легкий")
 
-    @discord.ui.button(label="Середній", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="Середній", emoji="🔵", style=discord.ButtonStyle.primary)
     async def medium(self, interaction, button):
         await self.choose(interaction, 1, 5, 5, "Середній")
 
-    @discord.ui.button(label="Важкий", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="Важкий", emoji="🔴", style=discord.ButtonStyle.danger)
     async def hard(self, interaction, button):
         await self.choose(interaction, 1, 10, 10, "Важкий")
 
-    @discord.ui.button(label="Неможливий", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Неможливий", emoji="🟣", style=discord.ButtonStyle.secondary)
     async def impossible(self, interaction, button):
         await self.choose(interaction, 1, 50, 1000, "Неможливий")
 
@@ -1669,7 +1791,10 @@ class RigCoinModal(discord.ui.Modal, title="Накрутка монетки"):
         value = self.result.value.strip().lower()
         mapping = {"орел": "Орел", "решка": "Решка", "heads": "Орел", "tails": "Решка"}
         if value not in mapping: return await interaction.response.send_message("Напиши Орел або Решка.", ephemeral=True)
-        set_setting("coinflip_next", mapping[value]); await interaction.response.send_message(f"Наступного разу монетка покаже {mapping[value]}.", ephemeral=True)
+        set_setting("coinflip_next", mapping[value]); await interaction.response.send_message(
+            f"🎲 Накрутку встановлено: **{mapping[value]}**. Її отримає **перший наступний прокрут будь-якого користувача**, після чого вона автоматично зникне.",
+            ephemeral=True
+        )
 
 class AdminUserModal(discord.ui.Modal, title="Призначити адміністратора"):
     user_id = discord.ui.TextInput(label="ID користувача", placeholder="123456789012345678")
@@ -1722,6 +1847,123 @@ async def resolve_member(guild, value):
             return m
     return None
 
+def _chunk_text(text: str, limit: int = 3500):
+    if not text:
+        return ["—"]
+    return [text[i:i + limit] for i in range(0, len(text), limit)]
+
+
+def build_database_report():
+    """Build a human-readable read-only snapshot of all persistent bot data."""
+    conn = db()
+    try:
+        users = conn.execute(
+            "SELECT user_id, username, dick_size, balance, admin, daily_at, dick_at, created_at "
+            "FROM users ORDER BY balance DESC, user_id ASC"
+        ).fetchall()
+        promos = conn.execute(
+            "SELECT code, money, dick, created_by, created_at FROM promos ORDER BY code ASC"
+        ).fetchall()
+        uses = conn.execute(
+            "SELECT code, user_id, used_at FROM promo_uses ORDER BY code ASC, user_id ASC"
+        ).fetchall()
+        roles = conn.execute(
+            "SELECT role_id, guild_id, owner_id, name, color, price, for_sale FROM roles ORDER BY role_id ASC"
+        ).fetchall()
+        settings = conn.execute(
+            "SELECT key, value FROM bot_settings ORDER BY key ASC"
+        ).fetchall()
+        cookie = conn.execute(
+            "SELECT game_id, channel_id, proposer_id, opponent_id, bet, status, "
+            "proposer_score, opponent_score, started_at, ended_at "
+            "FROM cookie_games ORDER BY game_id DESC LIMIT 100"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    parts = []
+
+    users_text = []
+    for i, u in enumerate(users, 1):
+        users_text.append(
+            f"{i}. <@{u['user_id']}> | ID `{u['user_id']}` | "
+            f"💰 `{money(u['balance'])}` | 🍆 `{u['dick_size']} см` | "
+            f"admin=`{u['admin']}` | username=`{u['username'] or '—'}`"
+        )
+    parts.append(("👥 Користувачі", "\n".join(users_text) or "Немає записів."))
+
+    promo_text = [
+        f"🎟️ `{p['code']}` → 💰 `{money(p['money'])}`, 🍆 `{p['dick']:+d} см`, "
+        f"created_by=`{p['created_by']}`"
+        for p in promos
+    ]
+    parts.append(("🎟️ Промокоди", "\n".join(promo_text) or "Немає промокодів."))
+
+    uses_text = [
+        f"`{x['code']}` → <@{x['user_id']}> (`{x['user_id']}`) | {x['used_at']}"
+        for x in uses
+    ]
+    parts.append(("✅ Активації промокодів", "\n".join(uses_text) or "Немає активацій."))
+
+    role_text = [
+        f"`{r['role_id']}` | **{discord.utils.escape_markdown(r['name'])}** | "
+        f"owner=`{r['owner_id']}` | price=`{money(r['price'])}` | sale=`{r['for_sale']}` | "
+        f"color=`#{r['color']:06X}` | guild=`{r['guild_id']}`"
+        for r in roles
+    ]
+    parts.append(("🏷️ Ролі", "\n".join(role_text) or "Немає записів."))
+
+    settings_text = [
+        f"`{x['key']}` = `{x['value']}`"
+        for x in settings
+    ]
+    parts.append(("⚙️ Одноразові налаштування / накрутки", "\n".join(settings_text) or "Немає активних значень."))
+
+    cookie_text = [
+        f"`#{x['game_id']}` | <@{x['proposer_id']}> vs <@{x['opponent_id']}> | "
+        f"💰 `{money(x['bet'])}` | `{x['status']}` | "
+        f"🍪 {x['proposer_score']}:{x['opponent_score']}"
+        for x in cookie
+    ]
+    parts.append(("🍪 Історія ігор", "\n".join(cookie_text) or "Немає записів."))
+
+    return parts
+
+
+async def send_database_report(interaction: discord.Interaction):
+    if not is_admin(interaction.user.id):
+        return await admin_denied(interaction)
+
+    try:
+        health = await asyncio.to_thread(database_health)
+        parts = await asyncio.to_thread(build_database_report)
+    except Exception as exc:
+        return await interaction.response.send_message(
+            f"❌ Не вдалося прочитати БД: `{exc!r}`", ephemeral=True
+        )
+
+    summary = (
+        f"**Стан БД:** {'🟢 OK' if health['ok'] else '🔴 ПОМИЛКА'}\n"
+        f"Integrity: `{health['integrity']}`\n"
+        f"👥 Користувачів: **{health['users']}**\n"
+        f"🎟️ Промокодів: **{health['promos']}**\n"
+        f"📁 DB: `{DB_PATH}`\n"
+        f"💾 Backups: `{BACKUP_DIR}`"
+    )
+
+    await interaction.response.send_message(
+        embed=embed("🗄️ Повна інформація БД", summary, discord.Color.blurple()),
+        ephemeral=True
+    )
+
+    for title, text in parts:
+        chunks = _chunk_text(text)
+        for number, chunk in enumerate(chunks, 1):
+            suffix = f" ({number}/{len(chunks)})" if len(chunks) > 1 else ""
+            e = embed(title + suffix, chunk, discord.Color.dark_grey())
+            await interaction.followup.send(embed=e, ephemeral=True)
+
+
 class AdminView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=600)
@@ -1763,6 +2005,10 @@ class AdminView(discord.ui.View):
             return await admin_denied(interaction)
         await interaction.response.send_modal(TakeAdminModal())
 
+    @discord.ui.button(label="База даних", emoji="🗄️", style=discord.ButtonStyle.secondary, row=3)
+    async def database_info_btn(self, interaction, button):
+        await send_database_report(interaction)
+
     @discord.ui.button(label="Надіслати повідомлення", style=discord.ButtonStyle.secondary, row=3)
     async def msg_send_btn(self, interaction, button):
         if await self.check(interaction):
@@ -1772,7 +2018,7 @@ class AdminView(discord.ui.View):
 async def admin(interaction: discord.Interaction):
     if not is_admin(interaction.user.id): return await admin_denied(interaction)
     await interaction.response.send_message(
-        embed=embed("Адмін-панель", "Панель доступна адміністраторам.\nВласник також може призначати та знімати адміністраторів.", discord.Color.dark_red()),
+        embed=embed("🛠️ Адмін-панель", "💰 Економіка • 🍆 Розміри • 🎟️ Промокоди • 🎲 Накрутки • 🗄️ База даних\n\nПанель доступна адміністраторам. Власник також може призначати та знімати адміністраторів.", discord.Color.dark_red()),
         view=AdminView(), ephemeral=True
     )
 
