@@ -108,6 +108,38 @@ CASE_DATA = {
 CASE_WEIGHTS = [17 - i for i in range(17)]  # chance decreases with vehicle value
 CASE_TOTAL_WEIGHT = sum(CASE_WEIGHTS)
 
+# ---------------- REAL ESTATE ----------------
+HOUSES = [
+    ('Кімната в гуртожитку', 50000),
+    ('Смарт-квартира', 90000),
+    ('1-кімнатна квартира', 150000),
+    ('2-кімнатна квартира', 230000),
+    ('3-кімнатна квартира', 320000),
+    ('Квартира в новобудові', 450000),
+    ('Пентхаус у центрі', 650000),
+    ('Апартаменти бізнес-класу', 850000),
+    ('Дворівневі апартаменти', 1100000),
+    ('Таунхаус', 1400000),
+    ('Невеликий заміський будинок', 1800000),
+    ('Сучасний приватний будинок', 2300000),
+    ('Будинок із гаражем', 2900000),
+    ('Сімейний котедж', 3600000),
+    ('Котедж біля озера', 4500000),
+    ('Заміський маєток', 5500000),
+    ('Великий маєток', 6800000),
+    ('Панорамний будинок', 8200000),
+    ('Преміум-вілла', 10000000),
+    ('Вілла з басейном', 12500000),
+    ('Вілла на пагорбі', 15000000),
+    ('Розкішна вілла', 18000000),
+    ('Елітний маєток', 22000000),
+    ('Президентська резиденція', 28000000),
+    ('Острівна супер-вілла', 40000000)
+]
+HOUSES_BY_NAME = dict(HOUSES)
+MASTURBATION_COOLDOWN = 2 * 60 * 60
+MASTURBATION_DURATION = 30
+
 def case_chances(rarity: str):
     return [
         (car[0], car[1], car[2], weight / CASE_TOTAL_WEIGHT * 100)
@@ -118,43 +150,48 @@ def roll_case(rarity: str):
     chances = case_chances(rarity)
     return random.choices(chances, weights=[x[3] for x in chances], k=1)[0]
 
-def add_case_inventory(user_id: int, rarity: str, quantity: int):
+def add_inventory_item(user_id: int, item_type: str, item_key: str, quantity: int = 1):
     ensure_user(user_id)
     conn = db()
-    conn.execute(
-        """INSERT INTO case_inventory(user_id, rarity, quantity)
-           VALUES (?, ?, ?)
-           ON CONFLICT(user_id, rarity)
-           DO UPDATE SET quantity=quantity+excluded.quantity""",
-        (user_id, rarity, quantity),
-    )
-    conn.commit()
-    conn.close()
+    conn.execute("""INSERT INTO inventory_items(user_id,item_type,item_key,quantity)
+                    VALUES(?,?,?,?)
+                    ON CONFLICT(user_id,item_type,item_key)
+                    DO UPDATE SET quantity=quantity+excluded.quantity""",
+                 (user_id, item_type, item_key, quantity))
+    conn.commit(); conn.close()
 
-def remove_case_inventory(user_id: int, rarity: str, quantity: int = 1) -> bool:
+def remove_inventory_item(user_id: int, item_type: str, item_key: str, quantity: int = 1) -> bool:
     conn = db()
     try:
-        cur = conn.execute(
-            "UPDATE case_inventory SET quantity=quantity-? WHERE user_id=? AND rarity=? AND quantity>=?",
-            (quantity, user_id, rarity, quantity),
-        )
+        cur = conn.execute("""UPDATE inventory_items SET quantity=quantity-?
+                              WHERE user_id=? AND item_type=? AND item_key=? AND quantity>=?""",
+                           (quantity,user_id,item_type,item_key,quantity))
         if cur.rowcount != 1:
-            conn.rollback()
-            return False
-        conn.execute("DELETE FROM case_inventory WHERE user_id=? AND rarity=? AND quantity<=0", (user_id, rarity))
-        conn.commit()
-        return True
+            conn.rollback(); return False
+        conn.execute("DELETE FROM inventory_items WHERE user_id=? AND item_type=? AND item_key=? AND quantity<=0",
+                     (user_id,item_type,item_key))
+        conn.commit(); return True
     finally:
         conn.close()
 
-def get_case_inventory(user_id: int):
+def get_inventory_items(user_id: int, item_type: Optional[str] = None):
     conn = db()
-    rows = conn.execute(
-        "SELECT rarity, quantity FROM case_inventory WHERE user_id=? AND quantity>0 ORDER BY rowid",
-        (user_id,),
-    ).fetchall()
-    conn.close()
-    return rows
+    if item_type:
+        rows = conn.execute("""SELECT * FROM inventory_items WHERE user_id=? AND item_type=? AND quantity>0
+                               ORDER BY item_type,item_key""",(user_id,item_type)).fetchall()
+    else:
+        rows = conn.execute("""SELECT * FROM inventory_items WHERE user_id=? AND quantity>0
+                               ORDER BY item_type,item_key""",(user_id,)).fetchall()
+    conn.close(); return rows
+
+def add_case_inventory(user_id: int, rarity: str, quantity: int):
+    add_inventory_item(user_id, "case", rarity, quantity)
+
+def remove_case_inventory(user_id: int, rarity: str, quantity: int = 1) -> bool:
+    return remove_inventory_item(user_id, "case", rarity, quantity)
+
+def get_case_inventory(user_id: int):
+    return get_inventory_items(user_id, "case")
 
 COOKIE_WAIT_SECONDS = 10 * 60
 COOKIE_COUNTDOWN_SECONDS = 10
@@ -229,13 +266,11 @@ def _migrate_schema(conn):
             "username": "TEXT NOT NULL DEFAULT ''",
             "admin": "INTEGER NOT NULL DEFAULT 0",
             "created_at": "TEXT NOT NULL DEFAULT ''",
+            "active_car": "TEXT",
+            "primary_house": "TEXT",
         },
-        "promos": {
-            "created_at": "TEXT NOT NULL DEFAULT ''",
-        },
-        "promo_uses": {
-            "used_at": "TEXT NOT NULL DEFAULT ''",
-        },
+        "promos": {"created_at": "TEXT NOT NULL DEFAULT ''"},
+        "promo_uses": {"used_at": "TEXT NOT NULL DEFAULT ''"},
     }
     for table, columns in migrations.items():
         existing = _table_columns(conn, table)
@@ -462,6 +497,36 @@ def init_db():
         PRIMARY KEY(user_id, rarity)
     );
 
+    CREATE TABLE IF NOT EXISTS inventory_items (
+        user_id INTEGER NOT NULL,
+        item_type TEXT NOT NULL,
+        item_key TEXT NOT NULL,
+        quantity INTEGER NOT NULL DEFAULT 0,
+        acquired_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY(user_id, item_type, item_key)
+    );
+
+    CREATE TABLE IF NOT EXISTS market_listings (
+        listing_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        seller_id INTEGER NOT NULL,
+        item_type TEXT NOT NULL,
+        item_key TEXT NOT NULL,
+        price INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'active',
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        sold_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS masturbation_sessions (
+        session_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        started_at TEXT NOT NULL,
+        finishes_at TEXT NOT NULL,
+        reward INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'running',
+        finished_at TEXT
+    );
+
     CREATE TABLE IF NOT EXISTS cookie_games (
         game_id INTEGER PRIMARY KEY AUTOINCREMENT,
         channel_id INTEGER NOT NULL UNIQUE,
@@ -476,6 +541,8 @@ def init_db():
     );
     """)
     _migrate_schema(conn)
+    # Move legacy case inventory into the unified /inventory storage once.
+    conn.execute("""INSERT INTO inventory_items(user_id, item_type, item_key, quantity)\n                       SELECT user_id, 'case', rarity, quantity FROM case_inventory WHERE quantity > 0\n                       ON CONFLICT(user_id, item_type, item_key) DO UPDATE SET quantity=MAX(inventory_items.quantity, excluded.quantity)""")
     conn.commit()
     conn.close()
     _db_initialized = True
@@ -710,6 +777,8 @@ async def profile(interaction: discord.Interaction, user: discord.Member | None 
     e.set_thumbnail(url=target.display_avatar.url)
     e.add_field(name="🍆 Розмір", value=f"**{u['dick_size']} см**", inline=True)
     e.add_field(name="💰 Баланс", value=f"**{money(u['balance'])}**", inline=True)
+    e.add_field(name="🚗 Автомобіль", value=f"**{u['active_car'] or 'немає'}**", inline=False)
+    e.add_field(name="🏠 Дім", value=f"**{u['primary_house'] or 'немає'}**", inline=False)
     await interaction.response.send_message(embed=e)
 
 
@@ -1817,12 +1886,6 @@ async def role_buy(interaction: discord.Interaction, role: discord.Role):
     if not normal_channel_only(interaction): return await reject_wrong_channel(interaction)
     await buy_role(interaction, role.id)
 
-@bot.tree.command(name="inventory", description="Переглянути інвентар ролей")
-async def inventory(interaction: discord.Interaction):
-    if not normal_channel_only(interaction): return await reject_wrong_channel(interaction)
-    if not interaction.guild: return await interaction.response.send_message("Тільки на сервері.", ephemeral=True)
-    await show_inventory(interaction)
-
 
 # ---------------- CASES ----------------
 
@@ -1986,94 +2049,280 @@ async def send_case_chances(interaction: discord.Interaction):
             await interaction.followup.send(embed=e, ephemeral=True)
 
 
+class CarResultView(discord.ui.View):
+    def __init__(self, owner_id: int, car_name: str, car_value: int):
+        super().__init__(timeout=300)
+        self.owner_id = owner_id
+        self.car_name = car_name
+        self.car_value = car_value
+        self.done = False
+
+    async def interaction_check(self, interaction: discord.Interaction):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("❌ Ці кнопки доступні лише тому, хто відкрив кейс.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Забрати", emoji="🚗", style=discord.ButtonStyle.success)
+    async def claim(self, interaction: discord.Interaction, button):
+        if self.done:
+            return await interaction.response.send_message("❌ Цю машину вже оброблено.", ephemeral=True)
+        self.done = True
+        add_inventory_item(interaction.user.id, "car", self.car_name, 1)
+        conn=db()
+        row=conn.execute("SELECT active_car FROM users WHERE user_id=?",(interaction.user.id,)).fetchone()
+        if not row["active_car"]:
+            conn.execute("UPDATE users SET active_car=? WHERE user_id=?",(self.car_name,interaction.user.id))
+        conn.commit(); conn.close()
+        for item in self.children: item.disabled=True
+        await interaction.response.edit_message(
+            embed=embed("🚗 Машину забрано", f"**{self.car_name}** додано до твого інвентарю.\n\nПеревір `/inventory` або профіль.", discord.Color.green()),
+            view=self
+        )
+
+    @discord.ui.button(label="Продати", emoji="💰", style=discord.ButtonStyle.danger)
+    async def sell(self, interaction: discord.Interaction, button):
+        if self.done:
+            return await interaction.response.send_message("❌ Цю машину вже оброблено.", ephemeral=True)
+        self.done = True
+        money_add(interaction.user.id, self.car_value)
+        for item in self.children: item.disabled=True
+        await interaction.response.edit_message(
+            embed=embed("💰 Машину продано", f"**{self.car_name}** продано державі за **{money(self.car_value)}** 💰.", discord.Color.gold()),
+            view=self
+        )
+
 async def open_cases_and_send(interaction: discord.Interaction, rarity: str, quantity: int):
     data = CASE_DATA[rarity]
     results = [roll_case(rarity) for _ in range(quantity)]
-
-    # These cases were just purchased, so they are not in inventory.
-    for index, (name, value, jackpot, chance) in enumerate(results, 1):
+    for name, value, jackpot, chance in results:
         title = "🎰 ДЖЕКПОТ!" if jackpot else "🎁 Кейс відкрито"
-        text = (
-            f"{data['emoji']} Рідкість кейса: **{rarity}**\n\n"
-            f"🚗 Ви отримали: **{name}**\n"
-            f"💰 Вартість машини: **{money(value)}**"
-        )
+        text = f"{data['emoji']} Рідкість кейса: **{rarity}**\n\n🚗 Ви отримали: **{name}**\n💰 Вартість машини: **{money(value)}**"
         if jackpot:
             text += "\n\n🎰 **ЦЕ ДЖЕКПОТ! Вітаємо!**"
         await interaction.followup.send(
             embed=embed(title, text, discord.Color.gold() if jackpot else discord.Color.blurple()),
+            view=CarResultView(interaction.user.id, name, value),
             ephemeral=True
         )
 
 
-class CaseInventoryView(discord.ui.View):
-    def __init__(self, rows):
-        super().__init__(timeout=180)
-        options = [
-            discord.SelectOption(
-                label=f"{r['rarity']} — {r['quantity']} шт.",
-                value=r["rarity"],
-                emoji=CASE_DATA[r["rarity"]]["emoji"]
-            )
-            for r in rows
-        ]
+@bot.tree.command(name="inventory", description="Переглянути свій інвентар")
+async def inventory(interaction: discord.Interaction):
+    if not normal_channel_only(interaction):
+        return await reject_wrong_channel(interaction)
+    rows = get_inventory_items(interaction.user.id)
+    role_rows = await get_inventory_rows(interaction.guild, interaction.user.id) if interaction.guild else []
+    parts = []
+    for r in rows:
+        if r["item_type"] == "case":
+            label = f"{CASE_DATA.get(r['item_key'], {'emoji':'🎁'})['emoji']} Кейси: **{r['item_key']}** — {r['quantity']} шт."
+        elif r["item_type"] == "car":
+            label = f"🚗 **{r['item_key']}** — {r['quantity']} шт."
+        elif r["item_type"] == "house":
+            label = f"🏠 **{r['item_key']}** — {r['quantity']} шт."
+        else:
+            label = f"📦 **{r['item_key']}** — {r['quantity']} шт."
+        parts.append(label)
+    if role_rows:
+        parts.append("🏷️ Ролі: " + ", ".join(f"**{r['name']}**" for r in role_rows))
+    description = "\n".join(parts) if parts else "Твій інвентар порожній."
+    await interaction.response.send_message(embed=embed("🎒 Інвентар", description, discord.Color.blurple()), ephemeral=True)
+
+# ---------------- HOUSES ----------------
+class HouseShopView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+        options = [discord.SelectOption(label=name[:100], description=f"{money(price)} 💰", value=name)
+                   for name, price in HOUSES[:25]]
+        select = discord.ui.Select(placeholder="Обери нерухомість для купівлі", options=options)
+        select.callback = self.buy_house
+        self.add_item(select)
+
+    async def buy_house(self, interaction: discord.Interaction):
+        name = self.children[0].values[0]
+        price = HOUSES_BY_NAME[name]
+        u = get_user(interaction.user.id, interaction.user.name)
+        if u["balance"] < price:
+            return await interaction.response.send_message(f"❌ Недостатньо грошей. Потрібно **{money(price)}** 💰.", ephemeral=True)
+        if not money_add(interaction.user.id, -price):
+            return await interaction.response.send_message("❌ Не вдалося списати гроші.", ephemeral=True)
+        add_inventory_item(interaction.user.id, "house", name, 1)
+        conn=db()
+        row=conn.execute("SELECT primary_house FROM users WHERE user_id=?",(interaction.user.id,)).fetchone()
+        if not row["primary_house"]:
+            conn.execute("UPDATE users SET primary_house=? WHERE user_id=?",(name,interaction.user.id))
+        conn.commit(); conn.close()
+        await interaction.response.send_message(embed=embed("🏠 Нерухомість придбано", f"Ти придбав **{name}** за **{money(price)}** 💰.\n\nОб'єкт збережено в `/inventory`.", discord.Color.green()), ephemeral=True)
+
+@bot.tree.command(name="houses", description="Купити квартиру, будинок або віллу у держави")
+async def houses(interaction: discord.Interaction):
+    if not normal_channel_only(interaction): return await reject_wrong_channel(interaction)
+    lines = [f"**{i}. {name}** — {money(price)} 💰" for i,(name,price) in enumerate(HOUSES,1)]
+    await interaction.response.send_message(embed=embed("🏠 Державна нерухомість", "\n".join(lines), discord.Color.green()), view=HouseShopView())
+
+# ---------------- MARKET ----------------
+def find_inventory_item(user_id: int, item_type: str, item_key: str):
+    conn=db()
+    row=conn.execute("SELECT * FROM inventory_items WHERE user_id=? AND item_type=? AND item_key=? AND quantity>0",
+                     (user_id,item_type,item_key)).fetchone()
+    conn.close(); return row
+
+class MarketView(discord.ui.View):
+    def __init__(self, listings):
+        super().__init__(timeout=300)
+        options=[]
+        for r in listings[:25]:
+            seller=f"<@{r['seller_id']}>"
+            options.append(discord.SelectOption(
+                label=f"{r['item_key']}"[:100],
+                description=f"{money(r['price'])} 💰 • {r['item_type']} • {seller}"[:100],
+                value=str(r["listing_id"])
+            ))
         if options:
-            select = discord.ui.Select(placeholder="Обери кейс для відкриття", options=options)
-            select.callback = self.select_case
+            select=discord.ui.Select(placeholder="Обери оголошення для купівлі", options=options)
+            select.callback=self.buy_listing
             self.add_item(select)
 
-    async def select_case(self, interaction: discord.Interaction):
-        rarity = self.children[0].values[0]
-        rows = {r["rarity"]: r["quantity"] for r in get_case_inventory(interaction.user.id)}
-        quantity = rows.get(rarity, 0)
-        if quantity <= 0:
-            return await interaction.response.send_message("❌ Таких кейсів більше немає.", ephemeral=True)
-        if not remove_case_inventory(interaction.user.id, rarity, 1):
-            return await interaction.response.send_message("❌ Не вдалося відкрити кейс.", ephemeral=True)
-        await interaction.response.defer()
-        await open_cases_and_send(interaction, rarity, 1)
+    async def buy_listing(self, interaction: discord.Interaction):
+        listing_id=int(self.children[0].values[0])
+        conn=db()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            listing=conn.execute("SELECT * FROM market_listings WHERE listing_id=? AND status='active'",(listing_id,)).fetchone()
+            if not listing:
+                conn.rollback()
+                return await interaction.response.send_message("❌ Це оголошення вже недоступне.", ephemeral=True)
+            if listing["seller_id"] == interaction.user.id:
+                conn.rollback()
+                return await interaction.response.send_message("❌ Не можна купити власне оголошення.", ephemeral=True)
+            buyer=conn.execute("SELECT balance FROM users WHERE user_id=?",(interaction.user.id,)).fetchone()
+            if not buyer or buyer["balance"] < listing["price"]:
+                conn.rollback()
+                return await interaction.response.send_message("❌ Недостатньо грошей.", ephemeral=True)
+            conn.execute("UPDATE users SET balance=balance-? WHERE user_id=?",(listing["price"],interaction.user.id))
+            conn.execute("UPDATE users SET balance=balance+? WHERE user_id=?",(listing["price"],listing["seller_id"]))
+            conn.execute("""INSERT INTO inventory_items(user_id,item_type,item_key,quantity) VALUES(?,?,?,1)
+                            ON CONFLICT(user_id,item_type,item_key) DO UPDATE SET quantity=quantity+1""",
+                         (interaction.user.id,listing["item_type"],listing["item_key"]))
+            conn.execute("UPDATE market_listings SET status='sold', sold_at=? WHERE listing_id=?",
+                         (datetime.now(timezone.utc).isoformat(),listing_id))
+            if listing["item_type"]=="car":
+                row=conn.execute("SELECT active_car FROM users WHERE user_id=?",(interaction.user.id,)).fetchone()
+                if not row["active_car"]:
+                    conn.execute("UPDATE users SET active_car=? WHERE user_id=?",(listing["item_key"],interaction.user.id))
+            elif listing["item_type"]=="house":
+                row=conn.execute("SELECT primary_house FROM users WHERE user_id=?",(interaction.user.id,)).fetchone()
+                if not row["primary_house"]:
+                    conn.execute("UPDATE users SET primary_house=? WHERE user_id=?",(listing["item_key"],interaction.user.id))
+            conn.commit()
+        except Exception:
+            conn.rollback(); raise
+        finally: conn.close()
+        await interaction.response.send_message(embed=embed("🛒 Покупку завершено",
+            f"Ти придбав **{listing['item_key']}** у <@{listing['seller_id']}> за **{money(listing['price'])}** 💰.",
+            discord.Color.green()), ephemeral=True)
 
+@bot.tree.command(name="market", description="Ринок гравців: купівля та перегляд оголошень")
+async def market(interaction: discord.Interaction):
+    if not normal_channel_only(interaction): return await reject_wrong_channel(interaction)
+    conn=db()
+    listings=conn.execute("""SELECT * FROM market_listings WHERE status='active' ORDER BY created_at DESC LIMIT 25""").fetchall()
+    conn.close()
+    if not listings:
+        text="Зараз на ринку немає активних оголошень.\n\nВиставити майно можна командою `/market_sell`."
+    else:
+        text="\n".join(f"**#{r['listing_id']}** • {r['item_key']} • {money(r['price'])} 💰 • продавець <@{r['seller_id']}>" for r in listings)
+    await interaction.response.send_message(embed=embed("🏪 Ринок гравців",text,discord.Color.gold()), view=MarketView(listings) if listings else None)
 
-@bot.tree.command(name="case", description="Відкрити магазин кейсів")
-async def case(interaction: discord.Interaction):
-    if not normal_channel_only(interaction):
-        return await reject_wrong_channel(interaction)
-    await interaction.response.send_message(
-        embed=embed(
-            "🎁 Кейси",
-            "Обери рідкість кейса. З кожного кейса може випасти випадкова машина.\n\n"
-            "Різні кейси мають різні набори машин та шанси випадіння. "
-            "Детальні шанси кожної машини можна переглянути кнопкою **«Шанси»**.\n\n"
-            "🟢 **Звичайний** — 5 000 💰\n"
-            "🔵 **Рідкий** — 10 000 💰\n"
-            "🟣 **Епічний** — 20 000 💰\n"
-            "🟠 **Міфічний** — 50 000 💰\n"
-            "🟡 **Легендарний** — 100 000 💰",
-            discord.Color.blurple()
-        ),
-        view=CaseMainView()
-    )
+@bot.tree.command(name="market_sell", description="Виставити свою машину або нерухомість на ринок")
+@app_commands.describe(item_type="Тип майна", item_name="Точна назва з інвентарю", price="Ціна продажу")
+@app_commands.choices(item_type=[
+    app_commands.Choice(name="Автомобіль", value="car"),
+    app_commands.Choice(name="Нерухомість", value="house"),
+])
+async def market_sell(interaction: discord.Interaction, item_type: app_commands.Choice[str], item_name: str,
+                      price: app_commands.Range[int,1,MAX_BET]):
+    if not normal_channel_only(interaction): return await reject_wrong_channel(interaction)
+    item_type_value=item_type.value
+    if item_type_value=="house" and item_name not in HOUSES_BY_NAME:
+        return await interaction.response.send_message("❌ Такого об'єкта нерухомості не існує.", ephemeral=True)
+    row=find_inventory_item(interaction.user.id,item_type_value,item_name)
+    if not row:
+        return await interaction.response.send_message("❌ Цього майна немає у твоєму `/inventory`.", ephemeral=True)
+    if not remove_inventory_item(interaction.user.id,item_type_value,item_name,1):
+        return await interaction.response.send_message("❌ Не вдалося зарезервувати майно.", ephemeral=True)
+    conn=db()
+    conn.execute("INSERT INTO market_listings(seller_id,item_type,item_key,price) VALUES(?,?,?,?)",
+                 (interaction.user.id,item_type_value,item_name,price))
+    # If the listed asset was the profile's active one, clear the profile field.
+    if item_type_value=="car":
+        conn.execute("UPDATE users SET active_car=NULL WHERE user_id=? AND active_car=?",(interaction.user.id,item_name))
+    else:
+        conn.execute("UPDATE users SET primary_house=NULL WHERE user_id=? AND primary_house=?",(interaction.user.id,item_name))
+    conn.commit(); conn.close()
+    await interaction.response.send_message(embed=embed("🏷️ Оголошення створено",
+        f"**{item_name}** виставлено на ринок за **{money(price)}** 💰.\n\nПокупці побачать його через `/market`.",discord.Color.blurple()),ephemeral=True)
 
+# ---------------- MASTURBATION ----------------
+async def finish_masturbation_session(session_id: int):
+    await asyncio.sleep(MASTURBATION_DURATION)
+    conn=db()
+    try:
+        row=conn.execute("SELECT * FROM masturbation_sessions WHERE session_id=? AND status='running'",(session_id,)).fetchone()
+        if not row: return
+        conn.execute("UPDATE users SET balance=balance+? WHERE user_id=?",(row["reward"],row["user_id"]))
+        conn.execute("UPDATE masturbation_sessions SET status='finished', finished_at=? WHERE session_id=?",
+                     (datetime.now(timezone.utc).isoformat(),session_id))
+        conn.commit()
+        user=bot.get_user(row["user_id"])
+        if user:
+            try:
+                await user.send(embed=embed("💰 Бонус отримано!",f"Ти закінчив. Твій бонус: **{money(row['reward'])}** 💰.",discord.Color.green()))
+            except discord.HTTPException:
+                pass
+    finally: conn.close()
 
-@bot.tree.command(name="case_inventory", description="Переглянути інвентар кейсів")
-async def case_inventory(interaction: discord.Interaction):
-    if not normal_channel_only(interaction):
-        return await reject_wrong_channel(interaction)
-    rows = get_case_inventory(interaction.user.id)
-    if not rows:
-        return await interaction.response.send_message(
-            embed=embed("🎒 Інвентар кейсів", "Твій інвентар кейсів порожній."),
-            ephemeral=True
-        )
-    description = "\n".join(
-        f"{CASE_DATA[r['rarity']]['emoji']} **{r['rarity']}** — **{r['quantity']} шт.**"
-        for r in rows
-    )
-    await interaction.response.send_message(
-        embed=embed("🎒 Інвентар кейсів", description, discord.Color.blurple()),
-        view=CaseInventoryView(rows),
-        ephemeral=True
-    )
+async def resume_masturbation_sessions():
+    conn=db()
+    rows=conn.execute("SELECT session_id, finishes_at FROM masturbation_sessions WHERE status='running'").fetchall()
+    conn.close()
+    now=datetime.now(timezone.utc)
+    for row in rows:
+        delay=max(0,(parse_time(row["finishes_at"])-now).total_seconds())
+        async def worker(sid=row["session_id"], d=delay):
+            await asyncio.sleep(d); await finish_masturbation_session(sid)
+        asyncio.create_task(worker())
+
+@bot.tree.command(name="masturbation", description="Отримати бонус за завершення активності")
+async def masturbation(interaction: discord.Interaction):
+    if not normal_channel_only(interaction): return await reject_wrong_channel(interaction)
+    conn=db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        running=conn.execute("SELECT 1 FROM masturbation_sessions WHERE user_id=? AND status='running'",(interaction.user.id,)).fetchone()
+        if running:
+            conn.rollback()
+            return await interaction.response.send_message("⏳ Ти вже виконуєш цю активність.",ephemeral=True)
+        last=conn.execute("""SELECT finished_at, started_at FROM masturbation_sessions
+                             WHERE user_id=? AND status='finished' ORDER BY session_id DESC LIMIT 1""",(interaction.user.id,)).fetchone()
+        if last:
+            left=cooldown_left(last["finished_at"],MASTURBATION_COOLDOWN)
+            if left.total_seconds()>0:
+                conn.rollback()
+                return await interaction.response.send_message(f"⏳ Наступний раз можна через **{fmt_duration(left)}**.",ephemeral=True)
+        now=datetime.now(timezone.utc)
+        finishes=now+timedelta(seconds=MASTURBATION_DURATION)
+        reward=random.randint(5_000,15_000)
+        cur=conn.execute("""INSERT INTO masturbation_sessions(user_id,started_at,finishes_at,reward,status)
+                            VALUES(?,?,?,?, 'running')""",(interaction.user.id,now.isoformat(),finishes.isoformat(),reward))
+        session_id=cur.lastrowid
+        conn.commit()
+    finally: conn.close()
+    asyncio.create_task(finish_masturbation_session(session_id))
+    await interaction.response.send_message(embed=embed("⏳ Активність розпочато",
+        "Ти почав. Коли завершиш, отримаєш випадковий бонус **від 5 000 до 15 000 💰**.\n\n⏱️ Тривалість: **30 секунд**.\n🔁 Повторити можна **раз на 2 години**.",discord.Color.blurple()),ephemeral=False)
+
 
 # ---------------- ADMIN ----------------
 
@@ -2263,8 +2512,11 @@ def build_database_report():
             "proposer_score, opponent_score, started_at, ended_at "
             "FROM cookie_games ORDER BY game_id DESC LIMIT 100"
         ).fetchall()
-        case_inventory_rows = conn.execute(
-            "SELECT user_id, rarity, quantity FROM case_inventory WHERE quantity > 0 ORDER BY user_id, rarity"
+        inventory_rows = conn.execute(
+            "SELECT user_id, item_type, item_key, quantity FROM inventory_items WHERE quantity > 0 ORDER BY user_id, item_type, item_key"
+        ).fetchall()
+        market_rows = conn.execute(
+            "SELECT listing_id, seller_id, item_type, item_key, price, status FROM market_listings ORDER BY listing_id DESC LIMIT 100"
         ).fetchall()
     finally:
         conn.close()
@@ -2315,11 +2567,17 @@ def build_database_report():
     ]
     parts.append(("🍪 Історія ігор", "\n".join(cookie_text) or "Немає записів."))
 
-    case_inventory_text = [
-        f"<@{x['user_id']}> | `{x['user_id']}` | {x['rarity']} | `{x['quantity']} шт.`"
-        for x in case_inventory_rows
+    inventory_text = [
+        f"<@{x['user_id']}> | `{x['item_type']}` | {x['item_key']} | `{x['quantity']} шт.`"
+        for x in inventory_rows
     ]
-    parts.append(("🎁 Інвентар кейсів", "\n".join(case_inventory_text) or "Немає кейсів в інвентарях."))
+    parts.append(("🎒 Загальний інвентар", "\n".join(inventory_text) or "Немає предметів в інвентарях."))
+
+    market_text = [
+        f"#{x['listing_id']} | seller=`{x['seller_id']}` | {x['item_type']} | {x['item_key']} | {money(x['price'])} | `{x['status']}`"
+        for x in market_rows
+    ]
+    parts.append(("🏪 Ринок", "\n".join(market_text) or "Немає оголошень."))
 
     return parts
 
@@ -2498,6 +2756,7 @@ async def promo_create(interaction: discord.Interaction, code: str, money_amount
 async def on_ready():
     global _backup_task
     init_db()
+    await resume_masturbation_sessions()
     if _backup_task is None or _backup_task.done():
         _backup_task = asyncio.create_task(backup_loop())
     try:
