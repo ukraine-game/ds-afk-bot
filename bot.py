@@ -471,12 +471,12 @@ class CoinChoiceView(discord.ui.View):
         for item in self.children:
             item.disabled = True
 
-    @discord.ui.button(label="Орел", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="Орел", emoji="🪙", style=discord.ButtonStyle.primary)
     async def heads(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.choice = "Орел"
         await self.finish(interaction)
 
-    @discord.ui.button(label="Решка", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Решка", emoji="🪙", style=discord.ButtonStyle.secondary)
     async def tails(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.choice = "Решка"
         await self.finish(interaction)
@@ -503,22 +503,22 @@ class CoinChoiceView(discord.ui.View):
                 winnings = self.bet * 2
                 money_add(self.owner_id, winnings)
                 text = (
-                    f"**{result}!**\n\n"
-                    f"Вітаю, <@{self.owner_id}>! Ти вгадав.\n"
-                    f"Виграш: **{money(winnings)}**."
+                    f"🪙 Випало: **{result}**! 🎉\n"
+                    f"Ти вгадав! Отримуєш **{money(winnings)}** 💰."
                 )
+                title = "🪙 Coinflip"
                 color = discord.Color.green()
             else:
                 text = (
-                    f"**{result}!**\n\n"
-                    f"На жаль, <@{self.owner_id}>, ти не вгадав.\n"
-                    f"Програна ставка: **{money(self.bet)}**."
+                    f"🪙 Випало: **{result}**! ❌\n"
+                    f"Ти програв ставку **{money(self.bet)}** 💰."
                 )
+                title = "🪙 Coinflip"
                 color = discord.Color.red()
 
             # The result is public so everyone in the channel can see it.
             await interaction.channel.send(
-                embed=embed("Результат монетки", text, color)
+                embed=embed(title, text, color)
             )
         except Exception as exc:
             # Do not leave the player stuck on the waiting message if something fails.
@@ -542,7 +542,7 @@ async def coinflip(interaction: discord.Interaction, bet: app_commands.Range[int
         return await interaction.response.send_message(f"❌ Недостатньо грошей. Баланс: **{money(u['balance'])}**.", ephemeral=True)
     money_add(interaction.user.id, -bet)
     await interaction.response.send_message(
-        embed=embed("Монетка", f"Ставка: **{money(bet)}**\n\nОбери сторону монетки. Це повідомлення бачиш тільки ти."),
+        embed=embed("🪙 Coinflip", f"Ставка: **{money(bet)}**\n\nОбери сторону монетки."),
         view=CoinChoiceView(interaction.user.id, bet),
         ephemeral=True,
     )
