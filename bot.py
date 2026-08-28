@@ -1543,6 +1543,8 @@ async def promo_create(interaction: discord.Interaction, code: str, money_amount
         conn.close(); return await interaction.response.send_message("Такий промокод уже існує.", ephemeral=True)
     conn.close(); await interaction.response.send_message(f"Промокод {code} створено. +{money(money_amount)}, {dick_amount:+d} см.", ephemeral=True)
 
+print("=== NEW AFK BOT VERSION 2026-08-28 ===")
+
 # ---------------- START ----------------
 
 @bot.event
