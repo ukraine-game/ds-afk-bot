@@ -35,21 +35,243 @@ ADMIN_IDS = {
 if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN is missing in .env / Railway Variables")
 
-# Railway: set DB_PATH=/data/bot.db and attach a persistent Volume mounted at /data.
-# Locally, bot.db is kept next to bot.py.
-DB_PATH = os.getenv("DB_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.db"))
+# ============================================================
+# DATABASE / RAILWAY PERSISTENCE
+# ============================================================
+# IMPORTANT:
+# On Railway, create a Volume mounted at /data and set:
+#     DB_PATH=/data/bot.db
+# The bot refuses to silently fall back to the ephemeral container
+# filesystem when running on Railway.
+IS_RAILWAY = bool(os.getenv("RAILWAY_ENVIRONMENT") or os.getenv("RAILWAY_PROJECT_ID"))
+DEFAULT_DB_PATH = "/data/bot.db" if IS_RAILWAY else os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.db")
+DB_PATH = os.path.abspath(os.path.expanduser(os.getenv("DB_PATH", DEFAULT_DB_PATH).strip()))
+BACKUP_DIR = os.path.abspath(os.path.expanduser(os.getenv("DB_BACKUP_DIR", os.path.join(os.path.dirname(DB_PATH), "backups")).strip()))
+BACKUP_INTERVAL_SECONDS = max(60, int(os.getenv("DB_BACKUP_INTERVAL_SECONDS", "300")))
+MAX_DB_BACKUPS = max(3, int(os.getenv("MAX_DB_BACKUPS", "30")))
+
+if IS_RAILWAY and not DB_PATH.startswith("/data/"):
+    raise RuntimeError(
+        "SAFETY STOP: Railway detected, but DB_PATH is not inside /data. "
+        "Attach a Railway Volume mounted at /data and set DB_PATH=/data/bot.db. "
+        "The bot will NOT start with an unsafe ephemeral database."
+    )
+
+DB_LOCK = asyncio.Lock()
+_backup_task: Optional[asyncio.Task] = None
+_db_initialized = False
+
+
+def _ensure_storage_dirs():
+    db_dir = os.path.dirname(DB_PATH) or "."
+    os.makedirs(db_dir, exist_ok=True)
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    if not os.access(db_dir, os.W_OK):
+        raise RuntimeError(f"Database directory is not writable: {db_dir}")
+    if not os.access(BACKUP_DIR, os.W_OK):
+        raise RuntimeError(f"Backup directory is not writable: {BACKUP_DIR}")
 
 
 def db():
-    os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, timeout=30)
+    _ensure_storage_dirs()
+    conn = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA synchronous=FULL")
+    conn.execute("PRAGMA wal_autocheckpoint=1000")
+    # WAL is ideal for a single Railway bot process and safe across restarts.
+    conn.execute("PRAGMA journal_mode=WAL")
     return conn
 
 
+def _table_columns(conn, table: str):
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _migrate_schema(conn):
+    # Safe, additive migrations for databases created by older versions.
+    migrations = {
+        "users": {
+            "username": "TEXT NOT NULL DEFAULT ''",
+            "admin": "INTEGER NOT NULL DEFAULT 0",
+            "created_at": "TEXT NOT NULL DEFAULT ''",
+        },
+        "promos": {
+            "created_at": "TEXT NOT NULL DEFAULT ''",
+        },
+        "promo_uses": {
+            "used_at": "TEXT NOT NULL DEFAULT ''",
+        },
+    }
+    for table, columns in migrations.items():
+        existing = _table_columns(conn, table)
+        for column, definition in columns.items():
+            if column not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def _integrity_check(path: str) -> bool:
+    if not os.path.exists(path) or os.path.getsize(path) < 4096:
+        return False
+    try:
+        conn = sqlite3.connect(path, timeout=10)
+        result = conn.execute("PRAGMA integrity_check").fetchone()[0]
+        conn.close()
+        return result == "ok"
+    except Exception:
+        return False
+
+
+def _checkpoint_wal():
+    try:
+        conn = db()
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.close()
+    except Exception as exc:
+        print(f"[DB] WAL checkpoint warning: {exc!r}")
+
+
+def _backup_once(reason: str = "scheduled") -> Optional[str]:
+    _ensure_storage_dirs()
+    if not os.path.exists(DB_PATH):
+        return None
+
+    # Make the SQLite backup from a consistent database snapshot.
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+    final_path = os.path.join(BACKUP_DIR, f"bot_{timestamp}_{reason}.db")
+    temp_path = final_path + ".tmp"
+
+    source = None
+    target = None
+    try:
+        source = sqlite3.connect(DB_PATH, timeout=30)
+        target = sqlite3.connect(temp_path)
+        with target:
+            source.backup(target, pages=256, sleep=0.05)
+        target.close(); target = None
+        source.close(); source = None
+
+        if not _integrity_check(temp_path):
+            raise RuntimeError("Backup integrity_check failed")
+        os.replace(temp_path, final_path)
+        _prune_backups()
+        return final_path
+    except Exception as exc:
+        print(f"[DB] Backup failed ({reason}): {exc!r}")
+        try:
+            if target: target.close()
+        except Exception: pass
+        try:
+            if source: source.close()
+        except Exception: pass
+        try:
+            if os.path.exists(temp_path): os.remove(temp_path)
+        except Exception: pass
+        return None
+
+
+def _prune_backups():
+    files = []
+    for name in os.listdir(BACKUP_DIR):
+        if name.startswith("bot_") and name.endswith(".db"):
+            path = os.path.join(BACKUP_DIR, name)
+            if os.path.isfile(path):
+                files.append((os.path.getmtime(path), path))
+    files.sort(reverse=True)
+    for _, path in files[MAX_DB_BACKUPS:]:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _restore_latest_backup() -> bool:
+    _ensure_storage_dirs()
+    candidates = []
+    for name in os.listdir(BACKUP_DIR):
+        if name.startswith("bot_") and name.endswith(".db"):
+            path = os.path.join(BACKUP_DIR, name)
+            if os.path.isfile(path) and _integrity_check(path):
+                candidates.append((os.path.getmtime(path), path))
+    if not candidates:
+        return False
+    candidates.sort(reverse=True)
+    latest = candidates[0][1]
+    temp = DB_PATH + ".restore.tmp"
+    try:
+        src = sqlite3.connect(latest)
+        dst = sqlite3.connect(temp)
+        with dst:
+            src.backup(dst, pages=256)
+        src.close(); dst.close()
+        if not _integrity_check(temp):
+            raise RuntimeError("Restored DB failed integrity_check")
+        os.replace(temp, DB_PATH)
+        print(f"[DB] Restored database from backup: {latest}")
+        return True
+    except Exception as exc:
+        print(f"[DB] Restore failed: {exc!r}")
+        try:
+            if os.path.exists(temp): os.remove(temp)
+        except OSError:
+            pass
+        return False
+
+
+def validate_database_startup():
+    """Hard safety checks before the bot starts serving economy commands."""
+    _ensure_storage_dirs()
+
+    # If the main file disappeared but a verified backup exists, restore it
+    # instead of silently starting with a brand-new empty economy.
+    if not os.path.exists(DB_PATH):
+        if _restore_latest_backup():
+            print("[DB] Main database was missing; restored verified backup.")
+        return
+
+    if not _integrity_check(DB_PATH):
+        print("[DB] WARNING: main database failed integrity_check. Trying latest valid backup...")
+        if not _restore_latest_backup():
+            raise RuntimeError(
+                "Database is corrupt and no valid backup is available. "
+                "Bot stopped to avoid making the situation worse."
+            )
+
+
+def database_health() -> dict:
+    try:
+        conn = db()
+        integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+        users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        promos = conn.execute("SELECT COUNT(*) FROM promos").fetchone()[0]
+        conn.close()
+        return {"ok": integrity == "ok", "integrity": integrity, "users": users, "promos": promos}
+    except Exception as exc:
+        return {"ok": False, "integrity": repr(exc), "users": -1, "promos": -1}
+
+
+async def backup_loop():
+    await asyncio.sleep(30)
+    while not bot.is_closed():
+        try:
+            async with DB_LOCK:
+                path = await asyncio.to_thread(_backup_once, "auto")
+                if path:
+                    print(f"[DB] Automatic backup: {path}")
+        except Exception as exc:
+            print(f"[DB] Backup loop error: {exc!r}")
+        await asyncio.sleep(BACKUP_INTERVAL_SECONDS)
+
+
 def init_db():
+    global _db_initialized
+    if _db_initialized:
+        return
+    validate_database_startup()
+    # Preserve the pre-migration state before any schema changes.
+    if os.path.exists(DB_PATH):
+        _backup_once("pre_migration")
     conn = db()
     conn.executescript("""
     CREATE TABLE IF NOT EXISTS users (
@@ -113,8 +335,10 @@ def init_db():
         ended_at TEXT
     );
     """)
+    _migrate_schema(conn)
     conn.commit()
     conn.close()
+    _db_initialized = True
 
 
 def ensure_user(user_id: int, username: str = ""):
@@ -138,11 +362,22 @@ def get_user(user_id: int, username: str = ""):
 
 
 def money_add(user_id: int, amount: int):
+    """Atomic balance change. Negative changes are rejected if balance is insufficient."""
     ensure_user(user_id)
     conn = db()
-    conn.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (amount, user_id))
-    conn.commit()
-    conn.close()
+    try:
+        if amount < 0:
+            cur = conn.execute(
+                "UPDATE users SET balance=balance+? WHERE user_id=? AND balance>=?",
+                (amount, user_id, -amount),
+            )
+        else:
+            cur = conn.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (amount, user_id))
+        ok = cur.rowcount == 1
+        conn.commit()
+        return ok
+    finally:
+        conn.close()
 
 
 def money_set(user_id: int, amount: int):
@@ -1612,7 +1847,21 @@ async def promo_create(interaction: discord.Interaction, code: str, money_amount
 
 @bot.event
 async def on_ready():
+    global _backup_task
     init_db()
+    if _backup_task is None or _backup_task.done():
+        _backup_task = asyncio.create_task(backup_loop())
+    try:
+        health = await asyncio.to_thread(database_health)
+        print(f"[DB] Health: {health}")
+        if not health["ok"]:
+            raise RuntimeError(f"Database integrity check failed: {health}")
+        # Create a verified backup after successful startup/migrations.
+        async with DB_LOCK:
+            await asyncio.to_thread(_backup_once, "startup")
+    except Exception as exc:
+        print(f"[DB] Startup safety check failed: {exc!r}")
+        raise
     try:
         if GUILD_ID:
             guild_obj = discord.Object(id=GUILD_ID)
@@ -1627,4 +1876,10 @@ async def on_ready():
 
 
 init_db()
+
+# Final best-effort backup on normal interpreter shutdown. Railway Volume remains
+# the primary persistence layer; backups are an additional recovery layer.
+import atexit
+atexit.register(lambda: _backup_once("shutdown"))
+
 bot.run(TOKEN)
