@@ -244,7 +244,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ---------------- DICK ----------------
 
-@bot.tree.command(name="dick", description="Щодня змінити свій розмір пісюна")
+@bot.tree.command(name="dick", description="Щодня змінити свій розмір")
 async def dick(interaction: discord.Interaction):
     if not normal_channel_only(interaction):
         return await reject_wrong_channel(interaction)
@@ -363,7 +363,7 @@ async def daily(interaction: discord.Interaction):
 
 # ---------------- TOP / HELP ----------------
 
-@bot.tree.command(name="top", description="Показати топ-3 користувачів за балансом")
+@bot.tree.command(name="top", description="Показати топ- користувачів за балансом")
 async def top(interaction: discord.Interaction):
     if not normal_channel_only(interaction):
         return await reject_wrong_channel(interaction)
@@ -386,11 +386,11 @@ async def help_cmd(interaction: discord.Interaction):
     if not normal_channel_only(interaction):
         return await reject_wrong_channel(interaction)
     e = embed("📚 Допомога", "Усі звичайні команди працюють тільки в цьому каналі.")
-    e.add_field(name="🍆 Профіль", value="`/dick` — раз на день змінює розмір.\n`/profile [user]` — профіль.\n`/money` — баланс.", inline=False)
-    e.add_field(name="💰 Економіка", value="`/daily` — щоденний бонус.\n`/pay member amount` — переказ грошей.\n`/top` — топ-3 за балансом.", inline=False)
-    e.add_field(name="🎰 Ігри", value="`/coinflip bet` — монетка.\n`/roulette bet` — рулетка.\n`/cookie user bet` — запропонувати гру в печеньку.", inline=False)
-    e.add_field(name="🏪 Ролі", value="`/role_create` — створити роль.\n`/role_sell role price` — виставити свою роль.\n`/role_shop` — магазин ролей; кнопка **Купити** купує вибрану роль.", inline=False)
-    e.add_field(name="🎟️ Інше", value="`/promo` — активувати промокод.", inline=False)
+    e.add_field(name="Профіль", value="`/dick` — раз на день змінює розмір.\n`/profile [user]` — профіль.\n`/money` — баланс.", inline=False)
+    e.add_field(name="Економіка", value="`/daily` — щоденний бонус.\n`/pay member amount` — переказ грошей.\n`/top` — топ-3 за балансом.", inline=False)
+    e.add_field(name="Ігри", value="`/coinflip bet` — монетка.\n`/roulette` — рулетка.\n`/cookie user bet` — запропонувати гру в печеньку.", inline=False)
+    e.add_field(name="Ролі", value="`/role_create` — створити роль.\n`/role_sell role price` — виставити свою роль.\n`/role_shop` — магазин ролей.", inline=False)
+    e.add_field(name="Інше", value="`/promo` — активувати промокод.", inline=False)
     if is_admin(interaction.user.id):
         e.add_field(name="🔒 Адмін", value="`/admin` — адмін-панель.\n`/givemoney`, `/setmoney`, `/setdick`, `/promo_create` — адміністративні команди.\nУсі команди з позначкою 🔒 доступні тільки адмінам.", inline=False)
     await interaction.response.send_message(embed=e)
@@ -859,6 +859,48 @@ class RoleBuySelect(discord.ui.Select):
         if not normal_channel_only(interaction):
             return await reject_wrong_channel(interaction)
         await buy_role(interaction, int(self.values[0]))
+
+class RoleShopView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+
+    @discord.ui.button(label="Купити", style=discord.ButtonStyle.success, row=0)
+    async def buy(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not normal_channel_only(interaction):
+            return await reject_wrong_channel(interaction)
+        rows = await role_shop_rows(interaction.guild)
+        if not rows:
+            return await interaction.response.send_message("Зараз у продажу немає ролей.", ephemeral=True)
+        await interaction.response.send_message(
+            embed=embed("Купівля ролі", "Обери роль, яку хочеш купити."),
+            view=RoleBuyView(rows),
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="Продати", style=discord.ButtonStyle.danger, row=0)
+    async def sell(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not normal_channel_only(interaction):
+            return await reject_wrong_channel(interaction)
+        rows = await get_inventory_rows(interaction.guild, interaction.user.id)
+        owned = await get_owned_not_inventory_rows(interaction.guild, interaction.user.id)
+        all_rows = rows + owned
+        # Remove duplicates while preserving order.
+        seen = set()
+        all_rows = [r for r in all_rows if not (r["role_id"] in seen or seen.add(r["role_id"]))]
+        if not all_rows:
+            return await interaction.response.send_message("У тебе немає ролей, які можна виставити на продаж.", ephemeral=True)
+        await interaction.response.send_message(
+            embed=embed("Продаж ролі", "Обери свою роль, яку хочеш виставити на продаж."),
+            view=RoleSellView(all_rows[:25]),
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="Створити", style=discord.ButtonStyle.primary, row=0)
+    async def create(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not normal_channel_only(interaction):
+            return await reject_wrong_channel(interaction)
+        await interaction.response.send_modal(RoleNameModal())
+
 
 class RoleBuyView(discord.ui.View):
     def __init__(self, rows):
