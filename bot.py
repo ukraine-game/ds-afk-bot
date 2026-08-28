@@ -1881,7 +1881,7 @@ class CaseQuantityView(discord.ui.View):
         for n in range(1, 11):
             button = discord.ui.Button(
                 label=str(n),
-                emoji=f"{n}\ufe0f\u20e3",
+                emoji=("🔟" if n == 10 else f"{n}\ufe0f\u20e3"),
                 style=discord.ButtonStyle.primary,
                 row=(n - 1) // 5
             )
