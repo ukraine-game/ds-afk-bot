@@ -244,7 +244,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ---------------- DICK ----------------
 
-@bot.tree.command(name="dick", description=" Щодня змінити свій розмір пісюна")
+@bot.tree.command(name="dick", description="Щодня змінити свій розмір пісюна")
 async def dick(interaction: discord.Interaction):
     if not normal_channel_only(interaction):
         return await reject_wrong_channel(interaction)
@@ -285,7 +285,7 @@ async def dick(interaction: discord.Interaction):
 
 # ---------------- PROFILE / MONEY ----------------
 
-@bot.tree.command(name="profile", description=" Показати профіль користувача")
+@bot.tree.command(name="profile", description="Показати профіль користувача")
 @app_commands.describe(user="Користувач, профіль якого показати")
 async def profile(interaction: discord.Interaction, user: discord.Member | None = None):
     if not normal_channel_only(interaction):
@@ -299,7 +299,7 @@ async def profile(interaction: discord.Interaction, user: discord.Member | None 
     await interaction.response.send_message(embed=e)
 
 
-@bot.tree.command(name="money", description=" Показати свій баланс")
+@bot.tree.command(name="money", description="Показати свій баланс")
 async def money_cmd(interaction: discord.Interaction):
     if not normal_channel_only(interaction):
         return await reject_wrong_channel(interaction)
@@ -309,7 +309,7 @@ async def money_cmd(interaction: discord.Interaction):
     ))
 
 
-@bot.tree.command(name="pay", description=" Відправити гроші іншому користувачу")
+@bot.tree.command(name="pay", description="Відправити гроші іншому користувачу")
 @app_commands.describe(member="Кому відправити", amount="Сума")
 async def pay(interaction: discord.Interaction, member: discord.Member, amount: app_commands.Range[int, 1, MAX_BET]):
     if not normal_channel_only(interaction):
@@ -343,7 +343,7 @@ async def pay(interaction: discord.Interaction, member: discord.Member, amount: 
 
 # ---------------- DAILY ----------------
 
-@bot.tree.command(name="daily", description=" Отримати щоденний бонус")
+@bot.tree.command(name="daily", description="Отримати щоденний бонус")
 async def daily(interaction: discord.Interaction):
     if not normal_channel_only(interaction):
         return await reject_wrong_channel(interaction)
@@ -363,7 +363,7 @@ async def daily(interaction: discord.Interaction):
 
 # ---------------- TOP / HELP ----------------
 
-@bot.tree.command(name="top", description=" Показати топ-3 користувачів за балансом")
+@bot.tree.command(name="top", description="Показати топ-3 користувачів за балансом")
 async def top(interaction: discord.Interaction):
     if not normal_channel_only(interaction):
         return await reject_wrong_channel(interaction)
@@ -381,7 +381,7 @@ async def top(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed("🏆 Топ-3 за балансом", "\n".join(lines), discord.Color.gold()))
 
 
-@bot.tree.command(name="help", description=" Список команд і пояснення")
+@bot.tree.command(name="help", description="Список команд і пояснення")
 async def help_cmd(interaction: discord.Interaction):
     if not normal_channel_only(interaction):
         return await reject_wrong_channel(interaction)
@@ -420,7 +420,7 @@ class PromoModal(discord.ui.Modal, title="Активація промокоду"
         )
 
 
-@bot.tree.command(name="promo", description=" Активувати промокод")
+@bot.tree.command(name="promo", description="Активувати промокод")
 async def promo(interaction: discord.Interaction):
     if not normal_channel_only(interaction):
         return await reject_wrong_channel(interaction)
@@ -471,7 +471,7 @@ class CoinChoiceView(discord.ui.View):
         self.stop()
 
 
-@bot.tree.command(name="coinflip", description=" Ставка на орла або решку")
+@bot.tree.command(name="coinflip", description="Ставка на орла або решку")
 @app_commands.describe(bet="Сума ставки")
 async def coinflip(interaction: discord.Interaction, bet: app_commands.Range[int, MIN_COINFLIP_BET, MAX_BET]):
     if not normal_channel_only(interaction):
@@ -745,7 +745,7 @@ async def scheduled_cookie_start(game: dict):
         await start_cookie_game(game)
 
 
-@bot.tree.command(name="cookie", description=" Запропонувати користувачу гру в печеньку")
+@bot.tree.command(name="cookie", description="Запропонувати користувачу гру в печеньку")
 @app_commands.describe(user="Користувач, якому пропонуєш гру", bet="Ставка, мінімум 1000")
 async def cookie(interaction: discord.Interaction, user: discord.Member, bet: app_commands.Range[int, MIN_COOKIE_BET, MAX_BET]):
     if not normal_channel_only(interaction):
@@ -1070,23 +1070,48 @@ async def create_custom_role(interaction, name, color_int):
         view=None
     )
 
-async def show_inventory(interaction):
+async def get_inventory_rows(guild: discord.Guild, user_id: int):
     conn = db()
     rows = conn.execute("""
         SELECT r.* FROM roles r
         JOIN role_inventory i ON i.role_id=r.role_id
         WHERE i.user_id=? AND r.guild_id=?
         ORDER BY i.added_at DESC
-    """, (interaction.user.id, interaction.guild.id)).fetchall()
+    """, (user_id, guild.id)).fetchall()
     conn.close()
+    return [r for r in rows if guild.get_role(r["role_id"])]
+
+
+async def get_owned_not_inventory_rows(guild: discord.Guild, user_id: int):
+    conn = db()
+    rows = conn.execute("""
+        SELECT r.* FROM roles r
+        WHERE r.guild_id=? AND r.owner_id=?
+          AND NOT EXISTS (
+              SELECT 1 FROM role_inventory i
+              WHERE i.role_id=r.role_id AND i.user_id=?
+          )
+        ORDER BY r.name
+    """, (guild.id, user_id, user_id)).fetchall()
+    conn.close()
+    return [r for r in rows if guild.get_role(r["role_id"])]
+
+
+async def show_inventory(interaction):
+    rows = await get_inventory_rows(interaction.guild, interaction.user.id)
     if not rows:
-        return await interaction.response.send_message("Інвентар порожній.", ephemeral=True)
-    desc = "\n".join(f"**{r['name']}** — роль з ID `{r['role_id']}`" for r in rows)
+        description = "Інвентар порожній."
+    else:
+        description = "\n".join(
+            f"**{r['name']}** — **{money(r['price']) if r['price'] else 'не продається'}**"
+            for r in rows[:25]
+        )
     await interaction.response.send_message(
-        embed=embed("Інвентар ролей", desc),
-        view=InventoryView([r["role_id"] for r in rows]),
+        embed=embed("Інвентар ролей", description),
+        view=InventoryView([r["role_id"] for r in rows[:25]]),
         ephemeral=True
     )
+
 
 class InventorySelect(discord.ui.Select):
     def __init__(self, role_ids, action):
@@ -1095,6 +1120,7 @@ class InventorySelect(discord.ui.Select):
             placeholder="Обери роль",
             options=[discord.SelectOption(label=str(rid), value=str(rid)) for rid in role_ids[:25]]
         )
+
     async def callback(self, interaction):
         rid = int(self.values[0])
         if self.action == "get":
@@ -1102,58 +1128,69 @@ class InventorySelect(discord.ui.Select):
             if not role:
                 return await interaction.response.send_message("Роль більше не існує.", ephemeral=True)
             try:
-                await interaction.user.add_roles(role)
+                await interaction.user.add_roles(role, reason="Отримання ролі з інвентарю")
             except discord.HTTPException:
                 return await interaction.response.send_message("Не вдалося видати роль.", ephemeral=True)
-            conn=db(); conn.execute("DELETE FROM role_inventory WHERE user_id=? AND role_id=?", (interaction.user.id, rid)); conn.commit(); conn.close()
+            conn = db()
+            conn.execute("DELETE FROM role_inventory WHERE user_id=? AND role_id=?", (interaction.user.id, rid))
+            conn.commit(); conn.close()
             return await interaction.response.send_message(f"Роль {role.mention} видано.", ephemeral=True)
         if self.action == "sell":
             return await interaction.response.send_modal(RoleSellModal(rid))
+        if self.action == "remove":
+            conn = db()
+            conn.execute("DELETE FROM role_inventory WHERE user_id=? AND role_id=?", (interaction.user.id, rid))
+            conn.commit(); conn.close()
+            return await interaction.response.send_message("Роль прибрано з інвентарю. Її можна буде знову додати через кнопку додавання.", ephemeral=True)
+
+
+class InventoryAddSelect(discord.ui.Select):
+    def __init__(self, rows):
+        super().__init__(
+            placeholder="Обери власну роль для інвентарю",
+            options=[
+                discord.SelectOption(label=str(r["name"])[:100], description="Додати до інвентарю", value=str(r["role_id"]))
+                for r in rows[:25]
+            ]
+        )
+
+    async def callback(self, interaction):
+        rid = int(self.values[0])
+        conn = db()
+        row = conn.execute("SELECT * FROM roles WHERE role_id=? AND guild_id=? AND owner_id=?", (rid, interaction.guild.id, interaction.user.id)).fetchone()
+        if not row:
+            conn.close()
+            return await interaction.response.send_message("Ця роль більше не належить тобі.", ephemeral=True)
+        conn.execute("INSERT OR IGNORE INTO role_inventory(user_id, role_id) VALUES (?, ?)", (interaction.user.id, rid))
+        conn.commit(); conn.close()
+        role = interaction.guild.get_role(rid)
+        await interaction.response.send_message(f"Роль {role.mention if role else row['name']} додано до інвентарю.", ephemeral=True)
+
+
+class InventoryAddView(discord.ui.View):
+    def __init__(self, rows):
+        super().__init__(timeout=180)
+        self.add_item(InventoryAddSelect(rows))
+
 
 class InventoryView(discord.ui.View):
     def __init__(self, role_ids):
         super().__init__(timeout=180)
-        self.add_item(InventorySelect(role_ids, "get"))
-        self.add_item(InventorySelect(role_ids, "sell"))
+        if role_ids:
+            self.add_item(InventorySelect(role_ids, "get"))
+            self.add_item(InventorySelect(role_ids, "sell"))
 
-class RoleShopView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=300)
-
-    @discord.ui.button(label="Оновити", style=discord.ButtonStyle.secondary)
-    async def refresh(self, interaction, button):
-        if not normal_channel_only(interaction): return await reject_wrong_channel(interaction)
-        await interaction.response.edit_message(
-            embed=embed("Магазин ролей", await role_shop_text(interaction.guild)),
-            view=RoleShopView()
-        )
-
-    @discord.ui.button(label="Купити", style=discord.ButtonStyle.success)
-    async def buy(self, interaction, button):
-        if not normal_channel_only(interaction): return await reject_wrong_channel(interaction)
-        rows = await role_shop_rows(interaction.guild)
+    @discord.ui.button(label="Додати роль", style=discord.ButtonStyle.primary, row=2)
+    async def add_role(self, interaction, button):
+        rows = await get_owned_not_inventory_rows(interaction.guild, interaction.user.id)
         if not rows:
-            return await interaction.response.send_message("У магазині немає ролей для покупки.", ephemeral=True)
+            return await interaction.response.send_message("Немає власних ролей, які можна додати до інвентарю.", ephemeral=True)
         await interaction.response.send_message(
-            embed=embed("Купити роль", "Обери роль зі списку. ID вводити не потрібно."),
-            view=RoleBuyView(rows),
+            embed=embed("Додати роль в інвентар", "Обери свою роль, яку хочеш зберігати в інвентарі."),
+            view=InventoryAddView(rows),
             ephemeral=True
         )
 
-    @discord.ui.button(label="Продати", style=discord.ButtonStyle.danger)
-    async def sell(self, interaction, button):
-        if not normal_channel_only(interaction): return await reject_wrong_channel(interaction)
-        conn=db()
-        rows=conn.execute("SELECT * FROM roles WHERE guild_id=? AND owner_id=? AND for_sale=0 ORDER BY name", (interaction.guild.id, interaction.user.id)).fetchall()
-        conn.close()
-        if not rows:
-            return await interaction.response.send_message("У тебе немає ролей, які можна виставити на продаж.", ephemeral=True)
-        await interaction.response.send_message(embed=embed("Продати роль", "Обери свою роль і вкажи ціну."), view=RoleSellView(rows), ephemeral=True)
-
-    @discord.ui.button(label="Створити", style=discord.ButtonStyle.primary)
-    async def create(self, interaction, button):
-        if not normal_channel_only(interaction): return await reject_wrong_channel(interaction)
-        await interaction.response.send_modal(RoleNameModal())
 
 @bot.tree.command(name="role_shop", description="Переглянути магазин ролей")
 async def role_shop(interaction: discord.Interaction):
