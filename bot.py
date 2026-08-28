@@ -30,6 +30,132 @@ EMOJI_MONEY = "https://discord.com/assets/60e4658040396168.svg"
 MIN_COINFLIP_BET = 100
 MIN_COOKIE_BET = 1_000
 MAX_BET = 2_000_000_000
+
+# ---------------- CASES ----------------
+CASE_DATA = {
+    "Звичайний": {
+        "price": 5_000, "emoji": "🟢",
+        "cars": [
+            ("Daewoo Lanos", 2_500, False), ("Chevrolet Aveo (T250)", 3_000, False),
+            ("Opel Astra G", 3_500, False), ("Skoda Fabia I", 3_800, False),
+            ("Renault Megane II", 4_200, False), ("Volkswagen Golf IV", 4_500, False),
+            ("Peugeot 307", 4_700, False), ("Ford Focus I", 5_000, False),
+            ("Nissan Almera N16", 5_200, False), ("Honda Civic VI", 5_500, False),
+            ("Mitsubishi Lancer IX", 5_800, False), ("Mazda 323 (BJ)", 6_000, False),
+            ("Hyundai Elantra XD", 6_300, False), ("Toyota Corolla (E120)", 6_800, False),
+            ("BMW 3 Series (E36)", 7_500, True), ("Audi A4 (B6)", 7_800, True),
+            ("Mercedes-Benz W124", 8_500, True),
+        ],
+    },
+    "Рідкий": {
+        "price": 10_000, "emoji": "🔵",
+        "cars": [
+            ("Renault Fluence", 6_800, False), ("Ford Mondeo Mk4", 7_500, False),
+            ("Skoda Octavia A5 FL", 8_000, False), ("Kia Cerato II", 8_300, False),
+            ("Volkswagen Jetta VI", 8_700, False), ("Honda Civic VIII (5D / Sedan)", 9_000, False),
+            ("Hyundai Sonata YF", 9_500, False), ("Toyota Corolla (E150)", 10_000, False),
+            ("Mitsubishi Lancer X", 10_500, False), ("Volkswagen Passat B7", 11_500, False),
+            ("Subaru Legacy B14", 12_000, False), ("Mazda 6 (GH)", 12_500, False),
+            ("Nissan Teana (J32)", 13_000, False), ("BMW 3 Series (E90)", 14_000, True),
+            ("Audi A4 (B8)", 14_500, True), ("Lexus IS 250 (XE10 / XE20)", 15_500, True),
+            ("Infiniti G37", 16_500, True),
+        ],
+    },
+    "Епічний": {
+        "price": 20_000, "emoji": "🟣",
+        "cars": [
+            ("Ford Fusion Mk2 (USA)", 12_000, False), ("Volkswagen CC", 13_500, False),
+            ("Hyundai Genesis DH", 15_000, False), ("BMW 5 Series (F10)", 16_000, False),
+            ("Kia Optima / K5 (JF)", 17_000, False), ("Lexus IS 250 (XE20)", 18_000, False),
+            ("Volvo S60 II", 19_000, False), ("Audi A6 (C7)", 20_000, False),
+            ("Acura TLX (UB1)", 21_500, False), ("Mercedes-Benz E-Class (W212)", 23_000, False),
+            ("BMW 4 Series (F32)", 24_500, False), ("Mazda CX-5 (KF)", 26_000, False),
+            ("Subaru WRX STI (VA)", 27_500, False), ("Ford Mustang (S550, V6 / EcoBoost)", 29_000, True),
+            ("Alfa Romeo Giulia (952)", 31_000, True), ("Porsche Cayenne (92A)", 33_000, True),
+            ("Chevrolet Camaro VI", 35_000, True),
+        ],
+    },
+    "Міфічний": {
+        "price": 50_000, "emoji": "🟠",
+        "cars": [
+            ("Porsche Cayenne II (FL)", 34_000, False), ("BMW M4 (F82)", 38_000, False),
+            ("Lexus GS F", 40_000, False), ("Audi RS5 (B8 / B9)", 42_000, False),
+            ("Jaguar F-Type (S/V6)", 44_000, False), ("Tesla Model S Plaid / Performance", 47_000, False),
+            ("Alfa Romeo Giulia Quadrifoglio", 48_500, False), ("Mercedes-AMG C 63 (W205)", 50_000, False),
+            ("BMW M5 (F10)", 53_000, False), ("Audi RS6 (C7)", 55_000, False),
+            ("Chevrolet Corvette Stingray (C7)", 58_000, False), ("Ford Mustang Shelby GT350", 62_000, False),
+            ("Porsche 911 Carrera (997)", 65_000, False), ("BMW M5 (F90)", 70_000, True),
+            ("Nissan GT-R (R35)", 75_000, True), ("Mercedes-AMG E 63 S (W213)", 80_000, True),
+            ("Dodge Viper SRT-10", 88_000, True),
+        ],
+    },
+    "Легендарний": {
+        "price": 100_000, "emoji": "🟡",
+        "cars": [
+            ("BMW M8 Competition (F92)", 72_000, False), ("Audi R8 V10 Plus", 80_000, False),
+            ("Nissan GT-R Nismo", 85_000, False), ("Mercedes-AMG GT R", 90_000, False),
+            ("Porsche Panamera Turbo S (971)", 95_000, False), ("Aston Martin Vantage", 100_000, False),
+            ("Bentley Continental GT II", 110_000, False), ("Lamborghini Huracán", 120_000, False),
+            ("Porsche 911 Turbo S (991.2)", 130_000, False), ("Ferrari 458 Italia", 140_000, False),
+            ("Ford GT (2005)", 150_000, False), ("McLaren 720S", 165_000, True),
+            ("Lamborghini Aventador LP700-4", 175_000, True), ("Porsche 911 GT3 (991.2)", 185_000, True),
+            ("Ferrari 488 Pista", 210_000, True), ("Mercedes-Benz SLR McLaren", 240_000, True),
+            ("Porsche Carrera GT", 300_000, True),
+        ],
+    },
+}
+
+CASE_WEIGHTS = [17 - i for i in range(17)]  # chance decreases with vehicle value
+CASE_TOTAL_WEIGHT = sum(CASE_WEIGHTS)
+
+def case_chances(rarity: str):
+    return [
+        (car[0], car[1], car[2], weight / CASE_TOTAL_WEIGHT * 100)
+        for car, weight in zip(CASE_DATA[rarity]["cars"], CASE_WEIGHTS)
+    ]
+
+def roll_case(rarity: str):
+    chances = case_chances(rarity)
+    return random.choices(chances, weights=[x[3] for x in chances], k=1)[0]
+
+def add_case_inventory(user_id: int, rarity: str, quantity: int):
+    ensure_user(user_id)
+    conn = db()
+    conn.execute(
+        """INSERT INTO case_inventory(user_id, rarity, quantity)
+           VALUES (?, ?, ?)
+           ON CONFLICT(user_id, rarity)
+           DO UPDATE SET quantity=quantity+excluded.quantity""",
+        (user_id, rarity, quantity),
+    )
+    conn.commit()
+    conn.close()
+
+def remove_case_inventory(user_id: int, rarity: str, quantity: int = 1) -> bool:
+    conn = db()
+    try:
+        cur = conn.execute(
+            "UPDATE case_inventory SET quantity=quantity-? WHERE user_id=? AND rarity=? AND quantity>=?",
+            (quantity, user_id, rarity, quantity),
+        )
+        if cur.rowcount != 1:
+            conn.rollback()
+            return False
+        conn.execute("DELETE FROM case_inventory WHERE user_id=? AND rarity=? AND quantity<=0", (user_id, rarity))
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+def get_case_inventory(user_id: int):
+    conn = db()
+    rows = conn.execute(
+        "SELECT rarity, quantity FROM case_inventory WHERE user_id=? AND quantity>0 ORDER BY rowid",
+        (user_id,),
+    ).fetchall()
+    conn.close()
+    return rows
+
 COOKIE_WAIT_SECONDS = 10 * 60
 COOKIE_COUNTDOWN_SECONDS = 10
 COOKIE_PLAY_SECONDS = 60
@@ -327,6 +453,13 @@ def init_db():
         role_id INTEGER NOT NULL,
         added_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY(user_id, role_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS case_inventory (
+        user_id INTEGER NOT NULL,
+        rarity TEXT NOT NULL,
+        quantity INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY(user_id, rarity)
     );
 
     CREATE TABLE IF NOT EXISTS cookie_games (
@@ -1690,6 +1823,258 @@ async def inventory(interaction: discord.Interaction):
     if not interaction.guild: return await interaction.response.send_message("Тільки на сервері.", ephemeral=True)
     await show_inventory(interaction)
 
+
+# ---------------- CASES ----------------
+
+class CaseMainView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+
+    async def choose(self, interaction: discord.Interaction, rarity: str):
+        if not normal_channel_only(interaction):
+            return await reject_wrong_channel(interaction)
+        data = CASE_DATA[rarity]
+        u = get_user(interaction.user.id, interaction.user.name)
+        if u["balance"] < data["price"]:
+            return await interaction.response.send_message(
+                f"❌ Недостатньо грошей. Потрібно **{money(data['price'])}** 💰.\n"
+                f"Твій баланс: **{money(u['balance'])}** 💰.",
+                ephemeral=True
+            )
+        await interaction.response.send_message(
+            embed=embed(
+                f"{data['emoji']} {rarity} кейс",
+                f"Ціна одного кейса: **{money(data['price'])}** 💰\n\n"
+                "Обери, скільки кейсів хочеш придбати:",
+                discord.Color.gold()
+            ),
+            view=CaseQuantityView(rarity),
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="Звичайний | 5 тис.", emoji="🟢", style=discord.ButtonStyle.success, row=0)
+    async def common(self, interaction, button): await self.choose(interaction, "Звичайний")
+
+    @discord.ui.button(label="Рідкий | 10 тис.", emoji="🔵", style=discord.ButtonStyle.primary, row=0)
+    async def rare(self, interaction, button): await self.choose(interaction, "Рідкий")
+
+    @discord.ui.button(label="Епічний | 20 тис.", emoji="🟣", style=discord.ButtonStyle.primary, row=0)
+    async def epic(self, interaction, button): await self.choose(interaction, "Епічний")
+
+    @discord.ui.button(label="Міфічний | 50 тис.", emoji="🟠", style=discord.ButtonStyle.danger, row=0)
+    async def mythic(self, interaction, button): await self.choose(interaction, "Міфічний")
+
+    @discord.ui.button(label="Легендарний | 100 тис.", emoji="🟡", style=discord.ButtonStyle.secondary, row=0)
+    async def legendary(self, interaction, button): await self.choose(interaction, "Легендарний")
+
+    @discord.ui.button(label="Шанси", emoji="🎲", style=discord.ButtonStyle.secondary, row=1)
+    async def chances(self, interaction, button):
+        if not normal_channel_only(interaction):
+            return await reject_wrong_channel(interaction)
+        await send_case_chances(interaction)
+
+
+class CaseQuantityView(discord.ui.View):
+    def __init__(self, rarity: str):
+        super().__init__(timeout=180)
+        self.rarity = rarity
+        for n in range(1, 11):
+            button = discord.ui.Button(
+                label=str(n),
+                emoji=f"{n}\ufe0f\u20e3",
+                style=discord.ButtonStyle.primary,
+                row=(n - 1) // 5
+            )
+            button.callback = self.make_callback(n)
+            self.add_item(button)
+
+    def make_callback(self, quantity: int):
+        async def callback(interaction: discord.Interaction):
+            data = CASE_DATA[self.rarity]
+            total = data["price"] * quantity
+            u = get_user(interaction.user.id, interaction.user.name)
+            if u["balance"] < total:
+                return await interaction.response.send_message(
+                    f"❌ Недостатньо грошей для **{quantity}** шт.\n"
+                    f"Потрібно: **{money(total)}** 💰\n"
+                    f"Твій баланс: **{money(u['balance'])}** 💰.",
+                    ephemeral=True
+                )
+            if not money_add(interaction.user.id, -total):
+                return await interaction.response.send_message(
+                    "❌ Не вдалося списати гроші. Спробуй ще раз.", ephemeral=True
+                )
+
+            await interaction.response.send_message(
+                embed=embed(
+                    "✅ Кейс успішно придбано",
+                    f"{data['emoji']} Ви успішно придбали кейс рідкості **{self.rarity}**.\n\n"
+                    f"📦 Кількість: **{quantity} шт.**\n"
+                    f"💰 Витрачено: **{money(total)}**\n\n"
+                    "Можеш **відкрити їх зараз** або **закинути в інвентар**, щоб відкрити пізніше.",
+                    discord.Color.green()
+                ),
+                view=CasePurchaseView(self.rarity, quantity, interaction.user.id)
+            )
+        return callback
+
+
+class CasePurchaseView(discord.ui.View):
+    def __init__(self, rarity: str, quantity: int, owner_id: int):
+        super().__init__(timeout=300)
+        self.rarity = rarity
+        self.quantity = quantity
+        self.owner_id = owner_id
+        self.used = False
+
+    async def interaction_check(self, interaction: discord.Interaction):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "❌ Ці кнопки призначені користувачу, який придбав кейси.",
+                ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Відкрити зараз", emoji="🎁", style=discord.ButtonStyle.success)
+    async def open_now(self, interaction: discord.Interaction, button):
+        if self.used:
+            return await interaction.response.send_message("❌ Ця покупка вже оброблена.", ephemeral=True)
+        self.used = True
+        for item in self.children:
+            item.disabled = True
+
+        await interaction.response.edit_message(view=self)
+        await open_cases_and_send(interaction, self.rarity, self.quantity)
+
+    @discord.ui.button(label="В інвентар", emoji="🎒", style=discord.ButtonStyle.primary)
+    async def to_inventory(self, interaction: discord.Interaction, button):
+        if self.used:
+            return await interaction.response.send_message("❌ Ця покупка вже оброблена.", ephemeral=True)
+        self.used = True
+        for item in self.children:
+            item.disabled = True
+        add_case_inventory(interaction.user.id, self.rarity, self.quantity)
+        await interaction.response.edit_message(
+            embed=embed(
+                "🎒 Кейси додано в інвентар",
+                f"{CASE_DATA[self.rarity]['emoji']} **{self.rarity}** — **{self.quantity} шт.**\n\n"
+                "Тепер їх можна відкрити пізніше через інвентар.",
+                discord.Color.blurple()
+            ),
+            view=self
+        )
+
+
+async def send_case_chances(interaction: discord.Interaction):
+    # One embed per rarity keeps the complete 17-item list within Discord limits.
+    first = True
+    for rarity, data in CASE_DATA.items():
+        lines = []
+        for i, (name, value, jackpot, chance) in enumerate(case_chances(rarity), 1):
+            marker = " 🎰 **ДЖЕКПОТ**" if jackpot else ""
+            lines.append(f"`{i:02}` • **{name}** — {money(value)} 💰 — **{chance:.2f}%**{marker}")
+        e = embed(
+            f"{data['emoji']} Шанси — {rarity}",
+            "\n".join(lines),
+            discord.Color.gold()
+        )
+        if first:
+            await interaction.response.send_message(embed=e, ephemeral=True)
+            first = False
+        else:
+            await interaction.followup.send(embed=e, ephemeral=True)
+
+
+async def open_cases_and_send(interaction: discord.Interaction, rarity: str, quantity: int):
+    data = CASE_DATA[rarity]
+    results = [roll_case(rarity) for _ in range(quantity)]
+
+    # These cases were just purchased, so they are not in inventory.
+    for index, (name, value, jackpot, chance) in enumerate(results, 1):
+        title = "🎰 ДЖЕКПОТ!" if jackpot else "🎁 Кейс відкрито"
+        text = (
+            f"{data['emoji']} Рідкість кейса: **{rarity}**\n\n"
+            f"🚗 Ви отримали: **{name}**\n"
+            f"💰 Вартість машини: **{money(value)}**"
+        )
+        if jackpot:
+            text += "\n\n🎰 **ЦЕ ДЖЕКПОТ! Вітаємо!**"
+        await interaction.followup.send(
+            embed=embed(title, text, discord.Color.gold() if jackpot else discord.Color.blurple()),
+            ephemeral=True
+        )
+
+
+class CaseInventoryView(discord.ui.View):
+    def __init__(self, rows):
+        super().__init__(timeout=180)
+        options = [
+            discord.SelectOption(
+                label=f"{r['rarity']} — {r['quantity']} шт.",
+                value=r["rarity"],
+                emoji=CASE_DATA[r["rarity"]]["emoji"]
+            )
+            for r in rows
+        ]
+        if options:
+            select = discord.ui.Select(placeholder="Обери кейс для відкриття", options=options)
+            select.callback = self.select_case
+            self.add_item(select)
+
+    async def select_case(self, interaction: discord.Interaction):
+        rarity = self.children[0].values[0]
+        rows = {r["rarity"]: r["quantity"] for r in get_case_inventory(interaction.user.id)}
+        quantity = rows.get(rarity, 0)
+        if quantity <= 0:
+            return await interaction.response.send_message("❌ Таких кейсів більше немає.", ephemeral=True)
+        if not remove_case_inventory(interaction.user.id, rarity, 1):
+            return await interaction.response.send_message("❌ Не вдалося відкрити кейс.", ephemeral=True)
+        await interaction.response.defer()
+        await open_cases_and_send(interaction, rarity, 1)
+
+
+@bot.tree.command(name="case", description="Відкрити магазин кейсів")
+async def case(interaction: discord.Interaction):
+    if not normal_channel_only(interaction):
+        return await reject_wrong_channel(interaction)
+    await interaction.response.send_message(
+        embed=embed(
+            "🎁 Кейси",
+            "Обери рідкість кейса. З кожного кейса може випасти випадкова машина.\n\n"
+            "Різні кейси мають різні набори машин та шанси випадіння. "
+            "Детальні шанси кожної машини можна переглянути кнопкою **«Шанси»**.\n\n"
+            "🟢 **Звичайний** — 5 000 💰\n"
+            "🔵 **Рідкий** — 10 000 💰\n"
+            "🟣 **Епічний** — 20 000 💰\n"
+            "🟠 **Міфічний** — 50 000 💰\n"
+            "🟡 **Легендарний** — 100 000 💰",
+            discord.Color.blurple()
+        ),
+        view=CaseMainView()
+    )
+
+
+@bot.tree.command(name="case_inventory", description="Переглянути інвентар кейсів")
+async def case_inventory(interaction: discord.Interaction):
+    if not normal_channel_only(interaction):
+        return await reject_wrong_channel(interaction)
+    rows = get_case_inventory(interaction.user.id)
+    if not rows:
+        return await interaction.response.send_message(
+            embed=embed("🎒 Інвентар кейсів", "Твій інвентар кейсів порожній."),
+            ephemeral=True
+        )
+    description = "\n".join(
+        f"{CASE_DATA[r['rarity']]['emoji']} **{r['rarity']}** — **{r['quantity']} шт.**"
+        for r in rows
+    )
+    await interaction.response.send_message(
+        embed=embed("🎒 Інвентар кейсів", description, discord.Color.blurple()),
+        view=CaseInventoryView(rows),
+        ephemeral=True
+    )
+
 # ---------------- ADMIN ----------------
 
 def admin_denied(interaction):
@@ -1878,6 +2263,9 @@ def build_database_report():
             "proposer_score, opponent_score, started_at, ended_at "
             "FROM cookie_games ORDER BY game_id DESC LIMIT 100"
         ).fetchall()
+        case_inventory_rows = conn.execute(
+            "SELECT user_id, rarity, quantity FROM case_inventory WHERE quantity > 0 ORDER BY user_id, rarity"
+        ).fetchall()
     finally:
         conn.close()
 
@@ -1926,6 +2314,12 @@ def build_database_report():
         for x in cookie
     ]
     parts.append(("🍪 Історія ігор", "\n".join(cookie_text) or "Немає записів."))
+
+    case_inventory_text = [
+        f"<@{x['user_id']}> | `{x['user_id']}` | {x['rarity']} | `{x['quantity']} шт.`"
+        for x in case_inventory_rows
+    ]
+    parts.append(("🎁 Інвентар кейсів", "\n".join(case_inventory_text) or "Немає кейсів в інвентарях."))
 
     return parts
 
@@ -2015,6 +2409,7 @@ class AdminView(discord.ui.View):
             await interaction.response.send_modal(MsgSendModal())
 
 @bot.tree.command(name="admin", description="🔒 Адмін-панель")
+@app_commands.default_permissions(administrator=True)
 async def admin(interaction: discord.Interaction):
     if not is_admin(interaction.user.id): return await admin_denied(interaction)
     await interaction.response.send_message(
@@ -2023,12 +2418,14 @@ async def admin(interaction: discord.Interaction):
     )
 
 @bot.tree.command(name="givemoney", description="🔒 Видати гроші користувачу")
+@app_commands.default_permissions(administrator=True)
 @app_commands.describe(user="Користувач", amount="Кількість")
 async def givemoney(interaction: discord.Interaction, user: discord.Member, amount: app_commands.Range[int, 1, MAX_BET]):
     if not is_admin(interaction.user.id): return await admin_denied(interaction)
     money_add(user.id, amount); await interaction.response.send_message(f"{user.mention} отримав {money(amount)}.", ephemeral=True)
 
 @bot.tree.command(name="setmoney", description="🔒 Встановити баланс користувачу")
+@app_commands.default_permissions(administrator=True)
 @app_commands.describe(user="Користувач", amount="Новий баланс")
 async def setmoney(interaction: discord.Interaction, user: discord.Member, amount: app_commands.Range[int, 0, MAX_BET]):
     if not is_admin(interaction.user.id): return await admin_denied(interaction)
@@ -2036,6 +2433,7 @@ async def setmoney(interaction: discord.Interaction, user: discord.Member, amoun
     await interaction.response.send_message(f"Баланс {user.mention}: {money(old)} → {money(amount)}.", ephemeral=True)
 
 @bot.tree.command(name="setdick", description="🔒 Встановити розмір користувачу")
+@app_commands.default_permissions(administrator=True)
 @app_commands.describe(user="Користувач", size="Новий розмір")
 async def setdick(interaction: discord.Interaction, user: discord.Member, size: int):
     if not is_admin(interaction.user.id): return await admin_denied(interaction)
@@ -2043,18 +2441,21 @@ async def setdick(interaction: discord.Interaction, user: discord.Member, size: 
     await interaction.response.send_message(f"Розмір {user.mention}: {old} см → {size} см.", ephemeral=True)
 
 @bot.tree.command(name="giveadmin", description="🔒 Призначити адміністратора")
+@app_commands.default_permissions(administrator=True)
 @app_commands.describe(user="Користувач")
 async def giveadmin(interaction: discord.Interaction, user: discord.Member):
     if not is_owner(interaction.user.id): return await admin_denied(interaction)
     await give_admin(interaction, user)
 
 @bot.tree.command(name="takeadmin", description="🔒 Зняти адміністратора")
+@app_commands.default_permissions(administrator=True)
 @app_commands.describe(user="Користувач")
 async def takeadmin(interaction: discord.Interaction, user: discord.Member):
     if not is_owner(interaction.user.id): return await admin_denied(interaction)
     await take_admin(interaction, user)
 
 @bot.tree.command(name="setadmin", description="🔒 Змінити статус адміністратора")
+@app_commands.default_permissions(administrator=True)
 @app_commands.describe(user="Користувач", enabled="True — видати, False — забрати")
 async def setadmin(interaction: discord.Interaction, user: discord.Member, enabled: bool):
     if not is_owner(interaction.user.id):
@@ -2065,6 +2466,7 @@ async def setadmin(interaction: discord.Interaction, user: discord.Member, enabl
         await take_admin(interaction, user)
 
 @bot.tree.command(name="msg_send", description="🔒 Надіслати повідомлення користувачу в лс")
+@app_commands.default_permissions(administrator=True)
 @app_commands.describe(user="Користувач", text="Текст", attachment="Фото або відео")
 async def msg_send(interaction: discord.Interaction, user: discord.Member, text: str, attachment: Optional[discord.Attachment] = None):
     if not is_admin(interaction.user.id): return await admin_denied(interaction)
@@ -2078,6 +2480,7 @@ async def msg_send(interaction: discord.Interaction, user: discord.Member, text:
     await interaction.response.send_message(f"Повідомлення надіслано {user.mention}.", ephemeral=True)
 
 @bot.tree.command(name="promo_create", description="🔒 Створити промокод")
+@app_commands.default_permissions(administrator=True)
 @app_commands.describe(code="Код", money_amount="Гроші", dick_amount="Скільки см")
 async def promo_create(interaction: discord.Interaction, code: str, money_amount: app_commands.Range[int, 0, MAX_BET], dick_amount: int):
     if not is_admin(interaction.user.id): return await admin_denied(interaction)

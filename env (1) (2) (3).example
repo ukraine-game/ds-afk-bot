@@ -1,0 +1,7 @@
+# Local only. On Railway, add these as Variables in the service settings.
+DISCORD_TOKEN=PUT_YOUR_DISCORD_BOT_TOKEN_HERE
+GUILD_ID=PUT_YOUR_DISCORD_SERVER_ID_HERE
+# Optional emergency admin IDs, comma-separated. DB admin=1 also grants access.
+ADMIN_IDS=
+# Railway Volume: mount the volume at /data and keep this value.
+DB_PATH=/data/bot.db
