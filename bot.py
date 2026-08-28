@@ -539,6 +539,20 @@ def init_db():
         started_at TEXT,
         ended_at TEXT
     );
+
+    CREATE TABLE IF NOT EXISTS number_games (
+        game_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        channel_id INTEGER NOT NULL UNIQUE,
+        proposer_id INTEGER NOT NULL,
+        opponent_id INTEGER NOT NULL,
+        bet INTEGER NOT NULL,
+        proposer_number INTEGER,
+        opponent_number INTEGER,
+        current_guesser_id INTEGER,
+        status TEXT NOT NULL DEFAULT 'choosing',
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        ended_at TEXT
+    );
     """)
     _migrate_schema(conn)
     # Move legacy case inventory into the unified /inventory storage once.
@@ -707,7 +721,8 @@ def consume_setting(key: str):
 
 
 def normal_channel_only(interaction: discord.Interaction) -> bool:
-    return interaction.channel_id == NORMAL_CHANNEL_ID
+    # Owner and admins may use every command in every channel.
+    return is_admin(interaction.user.id) or interaction.channel_id == NORMAL_CHANNEL_ID
 
 
 async def reject_wrong_channel(interaction: discord.Interaction):
@@ -870,14 +885,12 @@ async def top(interaction: discord.Interaction):
 async def help_cmd(interaction: discord.Interaction):
     if not normal_channel_only(interaction):
         return await reject_wrong_channel(interaction)
-    e = embed("📚 Допомога", "Усі звичайні команди працюють тільки в цьому каналі.")
-    e.add_field(name="Профіль", value="`/dick` — раз на день змінює розмір.\n`/profile [user]` — профіль.\n`/money` — баланс.", inline=False)
-    e.add_field(name="Економіка", value="`/daily` — щоденний бонус.\n`/pay member amount` — переказ грошей.\n`/top` — топ-3 за балансом.", inline=False)
-    e.add_field(name="Ігри", value="`/coinflip bet` — монетка.\n`/roulette` — рулетка.\n`/cookie user bet` — запропонувати гру в печеньку.", inline=False)
-    e.add_field(name="Ролі", value="`/role_create` — створити роль.\n`/role_sell role price` — виставити свою роль.\n`/role_shop` — магазин ролей.", inline=False)
-    e.add_field(name="Інше", value="`/promo` — активувати промокод.", inline=False)
-    if is_admin(interaction.user.id):
-        e.add_field(name="🔒 Адмін", value="`/admin` — адмін-панель.\n`/givemoney`, `/setmoney`, `/setdick`, `/promo_create` — адміністративні команди.\nУсі команди з позначкою 🔒 доступні тільки адмінам.", inline=False)
+    e = embed("📚 Допомога", "Основні команди бота та ігри.")
+    e.add_field(name="Профіль", value="`/dick` — щоденна зміна розміру.\n`/profile [user]` — профіль.\n`/money` — баланс.", inline=False)
+    e.add_field(name="Економіка", value="`/daily` — бонус.\n`/pay member amount` — переказ.\n`/top` — топ-3.", inline=False)
+    e.add_field(name="🎒 Інвентар та майно", value="`/inventory` — перегляд і використання предметів.\n`/case` — магазин кейсів.\n`/houses` — купівля нерухомості.\n`/market` — ринок гравців.\n`/market_sell` — виставити майно на продаж.", inline=False)
+    e.add_field(name="🎮 Ігри", value="`/coinflip bet` — монетка.\n`/roulette` — рулетка.\n`/cookie user bet` — печенька.\n`/number user bet` — вгадай число 1–30.", inline=False)
+    e.add_field(name="✨ Інше", value="`/masturbation` — бонус раз на 2 години.\n`/promo` — активувати промокод.\n`/role_shop` — магазин ролей.\n`/role_create` — створити роль.", inline=False)
     await interaction.response.send_message(embed=e)
 
 
@@ -2418,6 +2431,249 @@ async def market_sell(interaction: discord.Interaction, item_type: app_commands.
     conn.commit(); conn.close()
     await interaction.response.send_message(embed=embed("🏷️ Оголошення створено",
         f"**{item_name}** виставлено на ринок за **{money(price)}** 💰.\n\nПокупці побачать його через `/market`.",discord.Color.blurple()),ephemeral=True)
+# ---------------- NUMBER DUEL ----------------
+NUMBER_MIN = 1
+NUMBER_MAX = 30
+NUMBER_DELETE_AFTER = 60
+number_games: dict[int, dict] = {}
+
+async def create_number_channel(guild: discord.Guild, proposer: discord.Member, opponent: discord.Member, bet: int):
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        proposer: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+        opponent: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, read_message_history=True),
+    }
+    category = discord.utils.get(guild.categories, name="Ігри")
+    channel = await guild.create_text_channel("вгадай-число-суперника", overwrites=overwrites, category=category, reason="Гра вгадай число")
+    conn = db()
+    cur = conn.execute("INSERT INTO number_games(channel_id,proposer_id,opponent_id,bet) VALUES(?,?,?,?)", (channel.id, proposer.id, opponent.id, bet))
+    game_id = cur.lastrowid
+    conn.commit(); conn.close()
+    game = {"game_id": game_id, "channel_id": channel.id, "proposer_id": proposer.id, "opponent_id": opponent.id, "bet": bet,
+            "proposer_number": None, "opponent_number": None, "current_guesser_id": None, "status": "choosing"}
+    number_games[channel.id] = game
+    return channel, game
+
+class NumberChallengeView(discord.ui.View):
+    def __init__(self, proposer_id: int, opponent_id: int, bet: int):
+        super().__init__(timeout=120)
+        self.proposer_id, self.opponent_id, self.bet = proposer_id, opponent_id, bet
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.opponent_id:
+            await interaction.response.send_message("❌ Ця пропозиція призначена іншому гравцю.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Прийняти", style=discord.ButtonStyle.success)
+    async def accept(self, interaction, button):
+        opponent = get_user(interaction.user.id, interaction.user.name)
+        proposer = get_user(self.proposer_id)
+        if opponent["balance"] < self.bet:
+            return await interaction.response.send_message(f"❌ У тебе недостатньо грошей для ставки **{money(self.bet)}**.", ephemeral=True)
+        if proposer["balance"] < self.bet:
+            return await interaction.response.send_message("❌ У суперника вже недостатньо грошей. Пропозицію скасовано.", ephemeral=True)
+        # Re-check both balances atomically, then reserve both stakes.
+        conn = db()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            p = conn.execute("SELECT balance FROM users WHERE user_id=?", (self.proposer_id,)).fetchone()
+            o = conn.execute("SELECT balance FROM users WHERE user_id=?", (interaction.user.id,)).fetchone()
+            if not p or not o or p["balance"] < self.bet or o["balance"] < self.bet:
+                conn.rollback()
+                return await interaction.response.send_message("❌ Не вистачає коштів для ставки.", ephemeral=True)
+            conn.execute("UPDATE users SET balance=balance-? WHERE user_id=?", (self.bet, self.proposer_id))
+            conn.execute("UPDATE users SET balance=balance-? WHERE user_id=?", (self.bet, interaction.user.id))
+            conn.commit()
+        finally:
+            conn.close()
+        proposer_member = interaction.guild.get_member(self.proposer_id)
+        if not proposer_member:
+            money_add(self.proposer_id, self.bet)
+            money_add(interaction.user.id, self.bet)
+            return await interaction.response.send_message("❌ Не вдалося знайти суперника на сервері.", ephemeral=True)
+        try:
+            channel, game = await create_number_channel(interaction.guild, proposer_member, interaction.user, self.bet)
+        except Exception:
+            money_add(self.proposer_id, self.bet); money_add(interaction.user.id, self.bet)
+            raise
+        await interaction.response.edit_message(embed=embed("🎯 Гру прийнято", f"Канал гри: {channel.mention}\nСтавка: **{money(self.bet)}** 💰", discord.Color.green()), view=None)
+        await channel.send(embed=embed("🎯 Вгадай число суперника", f"{proposer_member.mention} та {interaction.user.mention}, оберіть **таємне число від 1 до 30**.\n\nЧисло бачите тільки ви — бот покаже підтвердження приватно.", discord.Color.blurple()), view=NumberSecretView(channel.id, self.proposer_id, self.opponent_id))
+
+    @discord.ui.button(label="Відхилити", style=discord.ButtonStyle.danger)
+    async def decline(self, interaction, button):
+        await interaction.response.edit_message(embed=embed("❌ Пропозицію відхилено", "Гру не створено."), view=None)
+
+class NumberSecretView(discord.ui.View):
+    def __init__(self, channel_id: int, proposer_id: int, opponent_id: int):
+        super().__init__(timeout=900)
+        self.channel_id, self.proposer_id, self.opponent_id, self.page = channel_id, proposer_id, opponent_id, 0
+        self.rebuild()
+
+    def rebuild(self):
+        self.clear_items()
+        start = self.page * 10 + 1
+        for n in range(start, start + 10):
+            button = discord.ui.Button(label=str(n), style=discord.ButtonStyle.primary, row=0 if n <= start + 4 else 1)
+            button.callback = self.make_number_callback(n)
+            self.add_item(button)
+        if self.page > 0:
+            button = discord.ui.Button(label="◀️", style=discord.ButtonStyle.secondary, row=2)
+            button.callback = self.prev
+            self.add_item(button)
+        if self.page < 2:
+            button = discord.ui.Button(label="▶️", style=discord.ButtonStyle.secondary, row=2)
+            button.callback = self.next
+            self.add_item(button)
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id not in (self.proposer_id, self.opponent_id):
+            await interaction.response.send_message("❌ Ти не береш участі в цій грі.", ephemeral=True)
+            return False
+        return True
+
+    async def prev(self, interaction):
+        self.page = max(0, self.page - 1); self.rebuild()
+        await interaction.response.edit_message(view=self)
+
+    async def next(self, interaction):
+        self.page = min(2, self.page + 1); self.rebuild()
+        await interaction.response.edit_message(view=self)
+
+    def make_number_callback(self, number: int):
+        async def callback(interaction):
+            conn = db()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute("SELECT * FROM number_games WHERE channel_id=? AND status='choosing'", (self.channel_id,)).fetchone()
+                if not row:
+                    conn.rollback(); return await interaction.response.send_message("❌ Вибір уже завершено.", ephemeral=True)
+                column = "proposer_number" if interaction.user.id == self.proposer_id else "opponent_number"
+                if row[column] is not None:
+                    conn.rollback(); return await interaction.response.send_message("❌ Ти вже обрав число.", ephemeral=True)
+                conn.execute(f"UPDATE number_games SET {column}=? WHERE channel_id=?", (number, self.channel_id))
+                conn.commit()
+                updated = conn.execute("SELECT * FROM number_games WHERE channel_id=?", (self.channel_id,)).fetchone()
+            finally:
+                conn.close()
+            await interaction.response.send_message(embed=embed("🔒 Число збережено", f"Твоє таємне число: **{number}**.\n\n⏳ Чекаємо на число суперника..."), ephemeral=True)
+            if updated["proposer_number"] is not None and updated["opponent_number"] is not None:
+                await start_number_round(interaction.channel, self.channel_id)
+            else:
+                other = self.opponent_id if interaction.user.id == self.proposer_id else self.proposer_id
+                await interaction.channel.send(f"<@{other}>", embed=embed("🔔 Суперник уже обрав число", "Тепер обери своє таємне число від 1 до 30."), delete_after=15)
+        return callback
+
+async def start_number_round(channel, channel_id):
+    conn = db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT * FROM number_games WHERE channel_id=?", (channel_id,)).fetchone()
+        if not row or row["status"] != "choosing":
+            conn.rollback(); return
+        guesser = random.choice([row["proposer_id"], row["opponent_id"]])
+        conn.execute("UPDATE number_games SET current_guesser_id=?, status='playing' WHERE channel_id=?", (guesser, channel_id))
+        conn.commit()
+    finally:
+        conn.close()
+    await channel.send(embed=embed("🎯 Гра починається!", f"Бот випадково обрав, хто починає: <@{guesser}>.\n\nТвоя черга — введи число від **1 до 30**.", discord.Color.gold()), view=NumberGuessView(channel_id))
+
+class NumberGuessView(discord.ui.View):
+    def __init__(self, channel_id):
+        super().__init__(timeout=900); self.channel_id = channel_id
+
+    @discord.ui.button(label="🎯 Вгадати число", style=discord.ButtonStyle.success)
+    async def guess(self, interaction, button):
+        conn = db(); row = conn.execute("SELECT current_guesser_id,status FROM number_games WHERE channel_id=?", (self.channel_id,)).fetchone(); conn.close()
+        if not row or row["status"] != "playing":
+            return await interaction.response.send_message("❌ Гра вже завершена.", ephemeral=True)
+        if row["current_guesser_id"] != interaction.user.id:
+            return await interaction.response.send_message("⏳ Зараз твоя черга ще не настала.", ephemeral=True)
+        await interaction.response.send_modal(NumberGuessModal(self.channel_id))
+
+class NumberGuessModal(discord.ui.Modal, title="🎯 Твоє припущення"):
+    number = discord.ui.TextInput(label="Число від 1 до 30", placeholder="Наприклад: 20", max_length=2, required=True)
+    def __init__(self, channel_id):
+        super().__init__(); self.channel_id = channel_id
+    async def on_submit(self, interaction):
+        try: guess = int(str(self.number.value).strip())
+        except ValueError: return await interaction.response.send_message("❌ Введи ціле число від 1 до 30.", ephemeral=True)
+        if not 1 <= guess <= 30: return await interaction.response.send_message("❌ Число має бути від 1 до 30.", ephemeral=True)
+        result = await process_number_guess(self.channel_id, interaction.user.id, guess, interaction.channel)
+        await interaction.response.send_message(result, ephemeral=True)
+
+async def process_number_guess(channel_id, user_id, guess, channel):
+    conn = db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT * FROM number_games WHERE channel_id=?", (channel_id,)).fetchone()
+        if not row or row["status"] != "playing":
+            conn.rollback(); return "❌ Гра вже завершена."
+        if row["current_guesser_id"] != user_id:
+            conn.rollback(); return "⏳ Зараз число вгадує суперник. Почекай своєї черги."
+        target = row["opponent_number"] if user_id == row["proposer_id"] else row["proposer_number"]
+        if guess == target:
+            winnings = row["bet"] * 2
+            conn.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (winnings, user_id))
+            conn.execute("UPDATE number_games SET status='finished', ended_at=? WHERE channel_id=?", (datetime.now(timezone.utc).isoformat(), channel_id))
+            conn.commit(); won = True
+        else:
+            next_id = row["opponent_id"] if user_id == row["proposer_id"] else row["proposer_id"]
+            conn.execute("UPDATE number_games SET current_guesser_id=? WHERE channel_id=?", (next_id, channel_id))
+            conn.commit(); won = False
+    finally:
+        conn.close()
+    if won:
+        await channel.send(embed=embed("🏆 Перемога!", f"🎯 <@{user_id}> вгадав число суперника!\n\n🔢 Загадане число: **{target}**\n💰 Переможець отримує **{money(winnings)}** 💰 (**X2** від ставки **{money(row['bet'])}**).", discord.Color.green()))
+        asyncio.create_task(delete_number_channel_later(channel, channel_id))
+        return f"🎉 Ти вгадав! Ти отримуєш **{money(winnings)}** 💰."
+    direction = "⬆️" if target > guess else "⬇️"
+    next_id = row["opponent_id"] if user_id == row["proposer_id"] else row["proposer_id"]
+    await channel.send(embed=embed("🎯 Підказка", f"<@{user_id}> назвав **{guess}**. {direction} **Число {'більше' if target > guess else 'менше'} за {guess}**.\n\nТепер черга <@{next_id}>.", discord.Color.blurple()), view=NumberGuessView(channel_id))
+    return f"{direction} Число {'більше' if target > guess else 'менше'} за **{guess}**. Тепер чекаємо на суперника."
+
+async def delete_number_channel_later(channel, channel_id):
+    await asyncio.sleep(NUMBER_DELETE_AFTER)
+    try: await channel.delete(reason="Гра вгадай число завершена")
+    except discord.HTTPException: pass
+    number_games.pop(channel_id, None)
+
+@bot.tree.command(name="number", description="Запропонувати гравцю гру вгадай число 1–30")
+@app_commands.describe(user="Суперник", bet="Ставка")
+async def number(interaction: discord.Interaction, user: discord.Member, bet: app_commands.Range[int, MIN_COINFLIP_BET, MAX_BET]):
+    if not normal_channel_only(interaction): return await reject_wrong_channel(interaction)
+    if not interaction.guild: return await interaction.response.send_message("Тільки на сервері.", ephemeral=True)
+    if user.bot or user.id == interaction.user.id: return await interaction.response.send_message("❌ Обери іншого гравця.", ephemeral=True)
+    u = get_user(interaction.user.id, interaction.user.name)
+    if u["balance"] < bet: return await interaction.response.send_message(f"❌ Недостатньо грошей. Потрібно **{money(bet)}** 💰.", ephemeral=True)
+    conn = db(); exists = conn.execute("SELECT 1 FROM number_games WHERE status IN ('choosing','playing') AND (proposer_id=? OR opponent_id=?)", (interaction.user.id, interaction.user.id)).fetchone(); conn.close()
+    if exists: return await interaction.response.send_message("❌ Ти вже береш участь у грі. Заверши її перед новою ставкою.", ephemeral=True)
+    await interaction.response.send_message(embed=embed("🎯 Пропозиція гри", f"{interaction.user.mention} пропонує {user.mention} зіграти у **вгадай число 1–30**.\n\n💰 Ставка: **{money(bet)}** з кожного.\n🏆 Переможець отримує **{money(bet*2)}** (X2).", discord.Color.gold()), view=NumberChallengeView(interaction.user.id, user.id, bet))
+
+@bot.tree.command(name="guess", description="Ввести число під час гри вгадай число")
+@app_commands.describe(number="Число від 1 до 30")
+async def guess_command(interaction: discord.Interaction, number: app_commands.Range[int, 1, 30]):
+    conn = db(); row = conn.execute("SELECT * FROM number_games WHERE channel_id=? AND status='playing'", (interaction.channel_id,)).fetchone(); conn.close()
+    if not row: return await interaction.response.send_message("❌ Тут немає активної гри вгадай число.", ephemeral=True)
+    result = await process_number_guess(interaction.channel_id, interaction.user.id, number, interaction.channel)
+    await interaction.response.send_message(result, ephemeral=True)
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot: return
+    conn = db(); row = conn.execute("SELECT * FROM number_games WHERE channel_id=? AND status='playing'", (message.channel.id,)).fetchone(); conn.close()
+    if row and message.content.strip().isdigit():
+        try: await message.delete()
+        except discord.HTTPException: pass
+        if row["current_guesser_id"] != message.author.id:
+            text = f"<@{message.author.id}> ⏳ Зараз число вгадує суперник. Зачекай своєї черги."
+        else:
+            text = f"<@{message.author.id}> 🎯 Використай кнопку **«Вгадати число»** або команду `/guess`."
+        try: await message.channel.send(text, delete_after=5)
+        except discord.HTTPException: pass
+        return
+    await bot.process_commands(message)
 
 # ---------------- MASTURBATION ----------------
 async def finish_masturbation_session(session_id: int):
