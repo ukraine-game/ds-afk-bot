@@ -1,98 +1,110 @@
 # Discord Economy Bot — Railway + SQLite Volume
 
-## What is used
-- Python + discord.py
-- SQLite (`bot.db`)
-- Railway persistent Volume for the database
-- No MySQL required
-- No database file should be committed to GitHub
+## Команди
 
-## Commands
-### User
-- `/dick` — daily size change; first-ever use is always positive.
-- `/profile [user]` — profile.
-- `/money` — balance.
-- `/daily` — daily reward.
-- `/pay member amount` — transfer money.
-- `/top` — top 3 by balance.
-- `/help` — help.
-- `/promo` — activate promo.
-- `/coinflip bet` — coin flip.
-- `/roulette bet number` — roulette, number 0–36.
-- `/cookie user bet` — cookie-game proposal, minimum 1000.
-- `/role_create` — create a custom role.
-- `/role_sell role price` — sell a custom role.
-- `/role_shop` — shop with Refresh and Buy buttons.
-- `/role_buy role_id` — buy a role by ID.
-- `!pecenka` — only inside an active cookie-game channel.
+### Користувачі
+- `/dick` — щодня змінити свій розмір.
+- `/profile [user]` — профіль.
+- `/money` — баланс.
+- `/daily` — щоденний бонус.
+- `/pay member amount` — переказ грошей.
+- `/top` — топ-3 за балансом.
+- `/help` — список команд.
+- `/promo` — активувати промокод.
+- `/coinflip bet` — монетка.
+- `/roulette` — вибір складності та гра з випадковим числом.
+- `/cookie user bet` — запропонувати гру в печеньку.
+- `/role_shop` — магазин ролей з кнопками «Купити», «Продати», «Створити».
+- `/role_create` — створення ролі через UI.
+- `/role_sell role price` — виставити власну роль на продаж.
+- `/role_buy role` — купити вибрану роль без введення ID.
+- `/inventory` — інвентар куплених/створених ролей.
+- `!pecenka` — механіка гри в печеньку.
 
-### Admin
-All admin commands are marked `🔒 Адмін` in Discord:
+## Ролі
+
+У `/role_shop`:
+- «Купити» відкриває список ролей для вибору, без введення ID.
+- «Продати» дозволяє вибрати власну роль та вказати ціну.
+- «Створити» спочатку просить назву, потім пропонує вибрати колір через Role Select.
+- Якщо обрано колір, створення коштує 200 000.
+- Якщо натиснути «Ні» на питанні про колір, створення скасовується.
+- Після покупки роль потрапляє в інвентар. Її можна одразу отримати, залишити в інвентарі або продати.
+- Ролі в інвентарі не видаються автоматично на сервер, доки користувач не натисне «Отримати роль».
+
+## Адміністратори
+
+Власник бота на цьому сервері має Discord ID `1455564327351226380` і завжди має всі адмін-права.
+
+Тільки власник може:
+- `/giveadmin user` — призначити адміністратора.
+- `/takeadmin user` — зняти адміністратора.
+- використовувати відповідні кнопки в `/admin`.
+
+Звичайний адміністратор не може призначати або знімати інших адміністраторів.
+
+Після призначення бот автоматично видає роль `1542839885055004672` та надсилає адміністратору DM embed про призначення.
+
+Адмін-команда:
 - `/admin`
 - `/givemoney`
 - `/setmoney`
 - `/setdick`
-- `/setadmin`
+- `/giveadmin`
+- `/takeadmin`
+- `/msg_send`
 - `/promo_create`
 
-Admin panel contains:
+У панелі також є:
 - Видати гроші
 - Встановити гроші
 - Встановити розмір
 - Накрутка рулетки
 - Накрутка монетки
+- Призначити адміністратора
+- Зняти адміністратора
+- Надіслати повідомлення
 
-The roulette/coinflip rig is consumed by the next corresponding game and then removed.
+`/msg_send user text` підтримує необов'язкове вкладення фото або відео. Кнопка в адмін-панелі відкриває UI для ніку/ID, тексту та необов'язкового URL на фото/відео.
 
-## Important Discord settings
-Enable **Message Content Intent** in the Discord Developer Portal because `!pecenka` and cookie-game message counting use message content.
+## Рулетка
 
-The bot needs at least:
+`/roulette` більше не просить ставку та число як параметри команди.
+
+Користувач обирає:
+- Легкий: 1–3, X3
+- Середній: 1–5, X5
+- Важкий: 1–10, X10
+- Неможливий: 1–50, X1000
+
+Після вибору користувач вводить число повідомленням. Ставкою є весь поточний баланс. При вгадуванні баланс множиться на відповідний коефіцієнт, при програші ставка знімається.
+
+## Важливі налаштування Discord
+
+Потрібен `Message Content Intent`, оскільки він використовується для `!pecenka` та вводу числа в рулетці.
+
+Боту потрібні щонайменше:
 - View Channels
 - Send Messages
 - Embed Links
 - Read Message History
-- Manage Channels (for cookie-game private channels)
-- Manage Roles (for role features)
+- Manage Channels
+- Manage Roles
 
-The bot's highest role must be above roles it creates/manages.
+Найвища роль бота повинна бути вище ролі `1542839885055004672` та ролей, які бот створює/видає.
 
-## Local run
-1. Copy `.env.example` to `.env`.
-2. Put your token/server ID/admin IDs in `.env`.
-3. For local use, change `DB_PATH` to `bot.db` or remove it.
-4. Install dependencies:
+## Railway
+
+Змінні:
+- `DISCORD_TOKEN`
+- `GUILD_ID`
+- `ADMIN_IDS` — необов'язково, додаткові emergency-admin ID.
+- `DB_PATH=/data/bot.db`
+
+Підключи Railway Volume до `/data`.
+
+Локальний запуск:
 ```bash
 py -m pip install -r requirements.txt
-```
-5. Run:
-```bash
 py bot.py
-```
-
-## Railway deployment
-1. Push the project to GitHub. Do **not** push `.env` or `bot.db`.
-2. Create a Railway project and deploy the GitHub repository.
-3. Add Variables:
-   - `DISCORD_TOKEN`
-   - `GUILD_ID`
-   - `ADMIN_IDS` (optional)
-   - `DB_PATH=/data/bot.db`
-4. Add a Railway **Volume** to the bot service and mount it at `/data`.
-5. Set the start command to:
-```bash
-python bot.py
-```
-6. Deploy/redeploy.
-
-The bot creates the SQLite database and tables automatically on first start. Because `bot.db` is on the persistent Volume, balances, dick sizes, roles, promo uses, admin flags, rigged results and cookie-game records survive container restarts and redeploys.
-
-## GitHub .gitignore
-Use:
-```gitignore
-.env
-bot.db
-*.db
-__pycache__/
-*.pyc
 ```

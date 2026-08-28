@@ -17,7 +17,9 @@ GUILD_ID = int(os.getenv("GUILD_ID", "0") or 0)
 NORMAL_CHANNEL_ID = 1542808823776026656
 START_DICK_SIZE = 0
 DAILY_REWARD = 50_000
-ROLE_CREATE_COST = 100_000
+ROLE_CREATE_COST = 200_000
+ROLE_ADMIN_ID = 1542839885055004672
+OWNER_ID = 1455564327351226380
 MIN_COINFLIP_BET = 100
 MIN_COOKIE_BET = 1_000
 MAX_BET = 2_000_000_000
@@ -89,6 +91,13 @@ def init_db():
     CREATE TABLE IF NOT EXISTS bot_settings (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS role_inventory (
+        user_id INTEGER NOT NULL,
+        role_id INTEGER NOT NULL,
+        added_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY(user_id, role_id)
     );
 
     CREATE TABLE IF NOT EXISTS cookie_games (
@@ -201,12 +210,16 @@ def money(n: int):
     return f"{n:,}"
 
 
+def is_owner(user_id: int):
+    return user_id == OWNER_ID
+
 def is_admin(user_id: int):
-    # ADMIN_IDS is a convenient emergency/owner override. The database admin flag
-    # is also respected, so /setadmin can be used without editing code.
-    if user_id in ADMIN_IDS:
+    if user_id == OWNER_ID or user_id in ADMIN_IDS:
         return True
     return bool(get_user(user_id)["admin"])
+
+def can_manage_admins(user_id: int):
+    return is_owner(user_id)
 
 
 def embed(title, description="", color=discord.Color.blurple()):
@@ -231,7 +244,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ---------------- DICK ----------------
 
-@bot.tree.command(name="dick", description="🍆 Щодня змінити свій розмір пісюна")
+@bot.tree.command(name="dick", description=" Щодня змінити свій розмір пісюна")
 async def dick(interaction: discord.Interaction):
     if not normal_channel_only(interaction):
         return await reject_wrong_channel(interaction)
@@ -272,7 +285,7 @@ async def dick(interaction: discord.Interaction):
 
 # ---------------- PROFILE / MONEY ----------------
 
-@bot.tree.command(name="profile", description="👤 Показати профіль користувача")
+@bot.tree.command(name="profile", description=" Показати профіль користувача")
 @app_commands.describe(user="Користувач, профіль якого показати")
 async def profile(interaction: discord.Interaction, user: discord.Member | None = None):
     if not normal_channel_only(interaction):
@@ -286,7 +299,7 @@ async def profile(interaction: discord.Interaction, user: discord.Member | None 
     await interaction.response.send_message(embed=e)
 
 
-@bot.tree.command(name="money", description="💰 Показати свій баланс")
+@bot.tree.command(name="money", description=" Показати свій баланс")
 async def money_cmd(interaction: discord.Interaction):
     if not normal_channel_only(interaction):
         return await reject_wrong_channel(interaction)
@@ -296,7 +309,7 @@ async def money_cmd(interaction: discord.Interaction):
     ))
 
 
-@bot.tree.command(name="pay", description="💸 Відправити гроші іншому користувачу")
+@bot.tree.command(name="pay", description=" Відправити гроші іншому користувачу")
 @app_commands.describe(member="Кому відправити", amount="Сума")
 async def pay(interaction: discord.Interaction, member: discord.Member, amount: app_commands.Range[int, 1, MAX_BET]):
     if not normal_channel_only(interaction):
@@ -330,7 +343,7 @@ async def pay(interaction: discord.Interaction, member: discord.Member, amount: 
 
 # ---------------- DAILY ----------------
 
-@bot.tree.command(name="daily", description="🎁 Отримати щоденний бонус")
+@bot.tree.command(name="daily", description=" Отримати щоденний бонус")
 async def daily(interaction: discord.Interaction):
     if not normal_channel_only(interaction):
         return await reject_wrong_channel(interaction)
@@ -350,7 +363,7 @@ async def daily(interaction: discord.Interaction):
 
 # ---------------- TOP / HELP ----------------
 
-@bot.tree.command(name="top", description="🏆 Показати топ-3 користувачів за балансом")
+@bot.tree.command(name="top", description=" Показати топ-3 користувачів за балансом")
 async def top(interaction: discord.Interaction):
     if not normal_channel_only(interaction):
         return await reject_wrong_channel(interaction)
@@ -368,7 +381,7 @@ async def top(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed("🏆 Топ-3 за балансом", "\n".join(lines), discord.Color.gold()))
 
 
-@bot.tree.command(name="help", description="📚 Список команд і пояснення")
+@bot.tree.command(name="help", description=" Список команд і пояснення")
 async def help_cmd(interaction: discord.Interaction):
     if not normal_channel_only(interaction):
         return await reject_wrong_channel(interaction)
@@ -407,7 +420,7 @@ class PromoModal(discord.ui.Modal, title="Активація промокоду"
         )
 
 
-@bot.tree.command(name="promo", description="🎟️ Активувати промокод")
+@bot.tree.command(name="promo", description=" Активувати промокод")
 async def promo(interaction: discord.Interaction):
     if not normal_channel_only(interaction):
         return await reject_wrong_channel(interaction)
@@ -458,7 +471,7 @@ class CoinChoiceView(discord.ui.View):
         self.stop()
 
 
-@bot.tree.command(name="coinflip", description="🪙 Ставка на орла або решку")
+@bot.tree.command(name="coinflip", description=" Ставка на орла або решку")
 @app_commands.describe(bet="Сума ставки")
 async def coinflip(interaction: discord.Interaction, bet: app_commands.Range[int, MIN_COINFLIP_BET, MAX_BET]):
     if not normal_channel_only(interaction):
@@ -472,33 +485,112 @@ async def coinflip(interaction: discord.Interaction, bet: app_commands.Range[int
 
 # ---------------- ROULETTE ----------------
 
-@bot.tree.command(name="roulette", description="🎰 Ставка на число рулетки 0-36")
-@app_commands.describe(bet="Сума ставки", number="Число від 0 до 36")
-async def roulette(interaction: discord.Interaction, bet: app_commands.Range[int, 100, MAX_BET], number: app_commands.Range[int, 0, 36]):
+@bot.tree.command(name="roulette", description="Спробувати вгадати випадкове число та примножити баланс")
+async def roulette(interaction: discord.Interaction):
     if not normal_channel_only(interaction):
         return await reject_wrong_channel(interaction)
-    u = get_user(interaction.user.id, interaction.user.name)
-    if u["balance"] < bet:
-        return await interaction.response.send_message("❌ Недостатньо грошей.", ephemeral=True)
-    money_add(interaction.user.id, -bet)
-    await interaction.response.send_message(embed=embed("🎰 Рулетка", "🎰 Крутимо..."))
-    await asyncio.sleep(2)
-    forced = get_setting("roulette_next")
-    if forced is not None:
-        try: result = int(forced)
-        except ValueError: result = random.randint(0, 36)
-        delete_setting("roulette_next")
-    else:
-        result = random.randint(0, 36)
-    if result == number:
-        winnings = bet * 35
-        money_add(interaction.user.id, winnings)
-        text = f"🎰 Випало: **{result}**\n\n🎉 Виграш! Ти отримуєш **{money(winnings)}** 💰."
-        color = discord.Color.green()
-    else:
-        text = f"🎰 Випало: **{result}**\n\n❌ Ти програв **{money(bet)}** 💰."
-        color = discord.Color.red()
-    await interaction.edit_original_response(embed=embed("🎰 Рулетка", text, color))
+    await interaction.response.send_message(
+        embed=embed(
+            "Рулетка",
+            "Бот загадає випадкове число. Якщо ти вгадаєш його, ставка помножиться на коефіцієнт. Якщо ні — ставка буде програна.\n\n"
+            "**Рівні складності:**\n"
+            "Легкий: від 1 до 3 — коефіцієнт X3\n"
+            "Середній: від 1 до 5 — коефіцієнт X5\n"
+            "Важкий: від 1 до 10 — коефіцієнт X10\n"
+            "Неможливий: від 1 до 50 — коефіцієнт X1000\n\n"
+            "Спочатку обери рівень складності."
+        ),
+        view=RouletteDifficultyView()
+    )
+
+class RouletteDifficultyView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+
+    async def choose(self, interaction: discord.Interaction, low: int, high: int, multiplier: int, label: str):
+        if not normal_channel_only(interaction):
+            return await reject_wrong_channel(interaction)
+        u = get_user(interaction.user.id, interaction.user.name)
+        if u["balance"] <= 0:
+            return await interaction.response.send_message("Недостатньо грошей. Потрібен позитивний баланс.", ephemeral=True)
+
+        await interaction.response.send_message(
+            embed=embed(
+                "Рулетка",
+                f"Ти обрав рівень **{label}**.\nЗагадай число від **{low}** до **{high}** і напиши його нижче одним повідомленням.",
+            ),
+            ephemeral=True
+        )
+
+        def check(m: discord.Message):
+            return m.author.id == interaction.user.id and m.channel.id == interaction.channel_id
+
+        try:
+            msg = await bot.wait_for("message", timeout=60, check=check)
+            guess = int(msg.content.strip())
+            if not low <= guess <= high:
+                return await interaction.followup.send(f"Число має бути від {low} до {high}.", ephemeral=True)
+        except (asyncio.TimeoutError):
+            return await interaction.followup.send("Час на відповідь вичерпано.", ephemeral=True)
+        except ValueError:
+            return await interaction.followup.send("Потрібно написати число.", ephemeral=True)
+
+        # Ставка дорівнює всьому поточному балансу користувача.
+        u = get_user(interaction.user.id, interaction.user.name)
+        bet = u["balance"]
+        money_add(interaction.user.id, -bet)
+        await interaction.followup.send(embed=embed("Рулетка", "Бот думає над числом..."))
+
+        await asyncio.sleep(2)
+        forced = get_setting("roulette_next")
+        if forced is not None:
+            try:
+                forced_number = int(forced)
+            except ValueError:
+                forced_number = None
+            if forced_number is not None and low <= forced_number <= high:
+                result = forced_number
+            else:
+                result = random.randint(low, high)
+            delete_setting("roulette_next")
+        else:
+            result = random.randint(low, high)
+
+        if result == guess:
+            winnings = bet * multiplier
+            money_add(interaction.user.id, winnings)
+            desc = (
+                f"Число **{result}**!\n\n"
+                f"Вітаю, ти вгадав!\n"
+                f"Твоя ставка **{money(bet)}** перетворилась на **{money(winnings)}**.\n"
+                f"Коефіцієнт: **X{multiplier}**."
+            )
+            color = discord.Color.green()
+        else:
+            desc = (
+                f"Число **{result}**!\n\n"
+                f"На жаль, ти не вгадав.\n"
+                f"Ти програв **{money(bet)}**."
+            )
+            color = discord.Color.red()
+
+        await interaction.followup.send(embed=embed("Результат рулетки", desc, color))
+
+    @discord.ui.button(label="Легкий", style=discord.ButtonStyle.success)
+    async def easy(self, interaction, button):
+        await self.choose(interaction, 1, 3, 3, "Легкий")
+
+    @discord.ui.button(label="Середній", style=discord.ButtonStyle.primary)
+    async def medium(self, interaction, button):
+        await self.choose(interaction, 1, 5, 5, "Середній")
+
+    @discord.ui.button(label="Важкий", style=discord.ButtonStyle.danger)
+    async def hard(self, interaction, button):
+        await self.choose(interaction, 1, 10, 10, "Важкий")
+
+    @discord.ui.button(label="Неможливий", style=discord.ButtonStyle.secondary)
+    async def impossible(self, interaction, button):
+        await self.choose(interaction, 1, 50, 1000, "Неможливий")
 
 
 # ---------------- COOKIE GAME ----------------
@@ -653,7 +745,7 @@ async def scheduled_cookie_start(game: dict):
         await start_cookie_game(game)
 
 
-@bot.tree.command(name="cookie", description="🍪 Запропонувати користувачу гру в печеньку")
+@bot.tree.command(name="cookie", description=" Запропонувати користувачу гру в печеньку")
 @app_commands.describe(user="Користувач, якому пропонуєш гру", bet="Ставка, мінімум 1000")
 async def cookie(interaction: discord.Interaction, user: discord.Member, bet: app_commands.Range[int, MIN_COOKIE_BET, MAX_BET]):
     if not normal_channel_only(interaction):
@@ -734,266 +826,643 @@ def role_color_to_int(value: str):
         raise ValueError
     return int(value, 16)
 
-
-class RoleCreateModal(discord.ui.Modal, title="Створення ролі"):
-    name = discord.ui.TextInput(label="Назва ролі", placeholder="VIP")
-    color = discord.ui.TextInput(label="Колір HEX", placeholder="#5865F2")
-    async def on_submit(self, interaction):
-        if not normal_channel_only(interaction): return await reject_wrong_channel(interaction)
-        u = get_user(interaction.user.id, interaction.user.name)
-        if u["balance"] < ROLE_CREATE_COST:
-            return await interaction.response.send_message(f"❌ Потрібно **{money(ROLE_CREATE_COST)}** 💰.", ephemeral=True)
-        try: color_int = role_color_to_int(self.color.value)
-        except ValueError: return await interaction.response.send_message("❌ Невірний HEX-колір. Приклад: `#5865F2`.", ephemeral=True)
-        name = str(self.name.value).strip()
-        if not 1 <= len(name) <= 100: return await interaction.response.send_message("❌ Назва має бути 1–100 символів.", ephemeral=True)
-        role = await interaction.guild.create_role(name=name, colour=discord.Colour(color_int), reason=f"Custom role created by {interaction.user}")
-        await interaction.user.add_roles(role)
-        money_add(interaction.user.id, -ROLE_CREATE_COST)
-        conn = db(); conn.execute("INSERT INTO roles(role_id, guild_id, owner_id, name, color, price, for_sale) VALUES (?, ?, ?, ?, ?, 0, 0)", (role.id, interaction.guild.id, interaction.user.id, name, color_int)); conn.commit(); conn.close()
-        await interaction.response.send_message(f"✅ Роль {role.mention} створено та видано тобі.\n💸 Вартість: **{money(ROLE_CREATE_COST)}** 💰.", ephemeral=True)
-
-
-@bot.tree.command(name="role_create", description="🏷️ Створити власну роль за 100,000")
-async def role_create(interaction: discord.Interaction):
-    if not normal_channel_only(interaction): return await reject_wrong_channel(interaction)
-    if not interaction.guild: return await interaction.response.send_message("❌ Тільки на сервері.", ephemeral=True)
-    await interaction.response.send_modal(RoleCreateModal())
-
-
 async def role_shop_rows(guild):
-    conn = db(); rows = conn.execute("SELECT * FROM roles WHERE guild_id=? AND for_sale=1 ORDER BY price ASC", (guild.id,)).fetchall(); conn.close()
-    return [r for r in rows if guild.get_role(r["role_id"])][:20]
-
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM roles WHERE guild_id=? AND for_sale=1 ORDER BY price ASC",
+        (guild.id,)
+    ).fetchall()
+    conn.close()
+    return [r for r in rows if guild.get_role(r["role_id"])][:25]
 
 async def role_shop_text(guild):
     rows = await role_shop_rows(guild)
-    if not rows: return "🏪 Зараз у продажу немає ролей."
-    return "\n".join(f"**{r['name']}** — **{money(r['price'])}** 💰 — продавець: <@{r['owner_id']}> — ID `{r['role_id']}`" for r in rows)
+    if not rows:
+        return "Зараз у продажу немає ролей."
+    return "\n".join(
+        f"**{r['name']}** — **{money(r['price'])}** — продавець: <@{r['owner_id']}>"
+        for r in rows
+    )
 
+class RoleBuySelect(discord.ui.Select):
+    def __init__(self, rows):
+        options = [
+            discord.SelectOption(
+                label=str(r["name"])[:100],
+                description=f"Ціна: {money(r['price'])}"[:100],
+                value=str(r["role_id"])
+            ) for r in rows
+        ]
+        super().__init__(placeholder="Обери роль, яку хочеш купити", options=options)
 
-class RoleBuyModal(discord.ui.Modal, title="Купити роль"):
-    role_id = discord.ui.TextInput(label="ID ролі", placeholder="Встав ID ролі з магазину")
-    async def on_submit(self, interaction):
-        if not normal_channel_only(interaction): return await reject_wrong_channel(interaction)
-        try: rid = int(self.role_id.value.strip())
-        except ValueError: return await interaction.response.send_message("❌ Невірний ID ролі.", ephemeral=True)
-        await buy_role(interaction, rid)
+    async def callback(self, interaction: discord.Interaction):
+        if not normal_channel_only(interaction):
+            return await reject_wrong_channel(interaction)
+        await buy_role(interaction, int(self.values[0]))
 
+class RoleBuyView(discord.ui.View):
+    def __init__(self, rows):
+        super().__init__(timeout=180)
+        if rows:
+            self.add_item(RoleBuySelect(rows))
 
 async def buy_role(interaction: discord.Interaction, role_id: int):
-    conn = db(); row = conn.execute("SELECT * FROM roles WHERE role_id=? AND guild_id=? AND for_sale=1", (role_id, interaction.guild.id)).fetchone()
-    conn.close()
-    if not row: return await interaction.response.send_message("❌ Ця роль не продається.", ephemeral=True)
-    if row["owner_id"] == interaction.user.id: return await interaction.response.send_message("❌ Не можна купити власну роль.", ephemeral=True)
-    buyer = get_user(interaction.user.id, interaction.user.name)
-    if buyer["balance"] < row["price"]: return await interaction.response.send_message("❌ Недостатньо грошей.", ephemeral=True)
-    role = interaction.guild.get_role(role_id)
-    if not role: return await interaction.response.send_message("❌ Роль більше не існує на сервері.", ephemeral=True)
-    price, seller_id = row["price"], row["owner_id"]
+    if not interaction.guild:
+        return await interaction.response.send_message("Тільки на сервері.", ephemeral=True)
     conn = db()
-    conn.execute("UPDATE users SET balance=balance-? WHERE user_id=? AND balance>=?", (price, interaction.user.id, price))
+    row = conn.execute(
+        "SELECT * FROM roles WHERE role_id=? AND guild_id=? AND for_sale=1",
+        (role_id, interaction.guild.id)
+    ).fetchone()
+    conn.close()
+    if not row:
+        return await interaction.response.send_message("Ця роль більше не продається.", ephemeral=True)
+    if row["owner_id"] == interaction.user.id:
+        return await interaction.response.send_message("Не можна купити власну роль.", ephemeral=True)
+
+    buyer = get_user(interaction.user.id, interaction.user.name)
+    price, seller_id = row["price"], row["owner_id"]
+    if buyer["balance"] < price:
+        return await interaction.response.send_message("Недостатньо грошей.", ephemeral=True)
+
+    role = interaction.guild.get_role(role_id)
+    if not role:
+        return await interaction.response.send_message("Роль більше не існує на сервері.", ephemeral=True)
+
+    conn = db()
+    conn.execute("UPDATE users SET balance=balance-? WHERE user_id=? AND balance>=?",
+                 (price, interaction.user.id, price))
     changed = conn.execute("SELECT changes() AS c").fetchone()["c"]
     if not changed:
-        conn.close(); return await interaction.response.send_message("❌ Недостатньо грошей.", ephemeral=True)
-    conn.execute("INSERT OR IGNORE INTO users(user_id, username, dick_size, balance) VALUES (?, ?, ?, 0)", (seller_id, str(seller_id), START_DICK_SIZE))
+        conn.close()
+        return await interaction.response.send_message("Недостатньо грошей.", ephemeral=True)
+
+    conn.execute("INSERT OR IGNORE INTO users(user_id, username, dick_size, balance) VALUES (?, ?, ?, 0)",
+                 (seller_id, str(seller_id), START_DICK_SIZE))
     conn.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (price, seller_id))
     conn.execute("UPDATE roles SET owner_id=?, for_sale=0 WHERE role_id=?", (interaction.user.id, role_id))
-    conn.commit(); conn.close()
+    conn.execute("INSERT OR IGNORE INTO role_inventory(user_id, role_id) VALUES (?, ?)", (interaction.user.id, role_id))
+    conn.commit()
+    conn.close()
+
     seller = interaction.guild.get_member(seller_id)
     if seller:
-        try: await seller.remove_roles(role)
-        except discord.HTTPException: pass
-    try: await interaction.user.add_roles(role)
-    except discord.HTTPException:
-        money_add(interaction.user.id, price); money_add(seller_id, -price)
-        conn = db(); conn.execute("UPDATE roles SET owner_id=?, for_sale=1 WHERE role_id=?", (seller_id, role_id)); conn.commit(); conn.close()
-        return await interaction.response.send_message("⚠️ Discord не дозволив видати роль, покупку скасовано.", ephemeral=True)
-    await interaction.response.send_message(f"✅ Ти купив {role.mention} за **{money(price)}** 💰.", ephemeral=True)
+        try:
+            await seller.remove_roles(role)
+        except discord.HTTPException:
+            pass
 
+    await interaction.response.send_message(
+        embed=embed(
+            "Роль придбано",
+            f"Ти придбав роль {role.mention} за **{money(price)}**.\n\nБажаєш зараз отримати її на сервері чи залишити в інвентарі?"
+        ),
+        view=PurchasedRoleView(role_id),
+        ephemeral=True
+    )
+
+class PurchasedRoleView(discord.ui.View):
+    def __init__(self, role_id):
+        super().__init__(timeout=180)
+        self.role_id = role_id
+
+    @discord.ui.button(label="Інвентар", style=discord.ButtonStyle.secondary)
+    async def inventory(self, interaction, button):
+        await show_inventory(interaction)
+
+    @discord.ui.button(label="Отримати роль", style=discord.ButtonStyle.success)
+    async def get_role(self, interaction, button):
+        role = interaction.guild.get_role(self.role_id)
+        if not role:
+            return await interaction.response.send_message("Роль більше не існує.", ephemeral=True)
+        try:
+            await interaction.user.add_roles(role)
+        except discord.HTTPException:
+            return await interaction.response.send_message("Discord не дозволив видати роль.", ephemeral=True)
+        conn = db()
+        conn.execute("DELETE FROM role_inventory WHERE user_id=? AND role_id=?", (interaction.user.id, self.role_id))
+        conn.commit(); conn.close()
+        await interaction.response.send_message(f"Роль {role.mention} видано тобі.", ephemeral=True)
+
+    @discord.ui.button(label="Продати", style=discord.ButtonStyle.danger)
+    async def sell(self, interaction, button):
+        await interaction.response.send_modal(RoleSellModal(self.role_id))
+
+class RoleSellModal(discord.ui.Modal, title="Продати роль"):
+    price = discord.ui.TextInput(label="Ціна", placeholder="100000", required=True)
+
+    def __init__(self, role_id=None):
+        super().__init__()
+        self.role_id = role_id
+
+    async def on_submit(self, interaction):
+        try:
+            price = int(str(self.price.value).strip())
+            if price < 1 or price > MAX_BET:
+                raise ValueError
+        except ValueError:
+            return await interaction.response.send_message("Невірна ціна.", ephemeral=True)
+
+        conn = db()
+        row = conn.execute("SELECT * FROM roles WHERE role_id=? AND owner_id=?",
+                           (self.role_id, interaction.user.id)).fetchone()
+        if not row:
+            conn.close()
+            return await interaction.response.send_message("Ця роль не належить тобі.", ephemeral=True)
+        conn.execute("UPDATE roles SET price=?, for_sale=1 WHERE role_id=?", (price, self.role_id))
+        conn.execute("DELETE FROM role_inventory WHERE user_id=? AND role_id=?", (interaction.user.id, self.role_id))
+        conn.commit(); conn.close()
+        await interaction.response.send_message(f"Роль виставлено на продаж за **{money(price)}**.", ephemeral=True)
+
+class RoleSellSelect(discord.ui.Select):
+    def __init__(self, rows):
+        options = [
+            discord.SelectOption(label=str(r["name"])[:100], value=str(r["role_id"]))
+            for r in rows[:25]
+        ]
+        super().__init__(placeholder="Обери роль для продажу", options=options)
+
+    async def callback(self, interaction):
+        await interaction.response.send_modal(RoleSellModal(int(self.values[0])))
+
+class RoleSellView(discord.ui.View):
+    def __init__(self, rows):
+        super().__init__(timeout=180)
+        if rows:
+            self.add_item(RoleSellSelect(rows))
+
+class RoleNameModal(discord.ui.Modal, title="Створення ролі"):
+    name = discord.ui.TextInput(label="Назва ролі", placeholder="VIP", min_length=1, max_length=100)
+
+    async def on_submit(self, interaction):
+        if not normal_channel_only(interaction):
+            return await reject_wrong_channel(interaction)
+        name = str(self.name.value).strip()
+        if not name:
+            return await interaction.response.send_message("Вкажи назву ролі.", ephemeral=True)
+        await interaction.response.send_message(
+            embed=embed("Колір ролі", "Бажаєш присвоїти ролі колір?\nЯкщо так — створення коштуватиме **200,000**."),
+            view=RoleColorChoiceView(name),
+            ephemeral=True
+        )
+
+class RoleColorChoiceView(discord.ui.View):
+    def __init__(self, name):
+        super().__init__(timeout=180)
+        self.name = name
+
+    @discord.ui.button(label="Так", style=discord.ButtonStyle.success)
+    async def yes(self, interaction, button):
+        await interaction.response.edit_message(
+            embed=embed("Вибір кольору", "Відміть існуючу роль з кольором, який хочеш використати."),
+            view=RoleColorSelectView(self.name)
+        )
+
+    @discord.ui.button(label="Ні", style=discord.ButtonStyle.secondary)
+    async def no(self, interaction, button):
+        await interaction.response.edit_message(
+            embed=embed("Створення скасовано", "Роль не було створено."),
+            view=None
+        )
+
+class RoleColorSelect(discord.ui.RoleSelect):
+    def __init__(self):
+        super().__init__(placeholder="Обери роль з потрібним кольором", min_values=1, max_values=1)
+
+    async def callback(self, interaction):
+        role = self.values[0]
+        if role.is_default() or role.managed:
+            return await interaction.response.send_message("Обери звичайну роль з кольором, не системну та не інтегровану.", ephemeral=True)
+        await create_custom_role(interaction, self.view.role_name, role.colour.value)
+
+class RoleColorSelectView(discord.ui.View):
+    def __init__(self, role_name):
+        super().__init__(timeout=180)
+        self.role_name = role_name
+        self.add_item(RoleColorSelect())
+
+async def create_custom_role(interaction, name, color_int):
+    cost = ROLE_CREATE_COST
+    u = get_user(interaction.user.id, interaction.user.name)
+    if u["balance"] < cost:
+        return await interaction.response.send_message(
+            f"Недостатньо грошей. Потрібно **{money(cost)}**.", ephemeral=True
+        )
+    try:
+        role = await interaction.guild.create_role(
+            name=name,
+            colour=discord.Colour(color_int),
+            reason=f"Custom role created by {interaction.user}"
+        )
+    except discord.HTTPException:
+        return await interaction.response.send_message("Не вдалося створити або видати роль.", ephemeral=True)
+
+    money_add(interaction.user.id, -cost)
+    conn = db()
+    conn.execute(
+        "INSERT INTO roles(role_id, guild_id, owner_id, name, color, price, for_sale) VALUES (?, ?, ?, ?, ?, 0, 0)",
+        (role.id, interaction.guild.id, interaction.user.id, name, color_int)
+    )
+    conn.execute("INSERT OR IGNORE INTO role_inventory(user_id, role_id) VALUES (?, ?)", (interaction.user.id, role.id))
+    conn.commit(); conn.close()
+    await interaction.response.edit_message(
+        embed=embed("Роль створено", f"Роль {role.mention} створено та додано до твого інвентарю.\nВартість: **{money(cost)}**."),
+        view=None
+    )
+
+async def show_inventory(interaction):
+    conn = db()
+    rows = conn.execute("""
+        SELECT r.* FROM roles r
+        JOIN role_inventory i ON i.role_id=r.role_id
+        WHERE i.user_id=? AND r.guild_id=?
+        ORDER BY i.added_at DESC
+    """, (interaction.user.id, interaction.guild.id)).fetchall()
+    conn.close()
+    if not rows:
+        return await interaction.response.send_message("Інвентар порожній.", ephemeral=True)
+    desc = "\n".join(f"**{r['name']}** — роль з ID `{r['role_id']}`" for r in rows)
+    await interaction.response.send_message(
+        embed=embed("Інвентар ролей", desc),
+        view=InventoryView([r["role_id"] for r in rows]),
+        ephemeral=True
+    )
+
+class InventorySelect(discord.ui.Select):
+    def __init__(self, role_ids, action):
+        self.action = action
+        super().__init__(
+            placeholder="Обери роль",
+            options=[discord.SelectOption(label=str(rid), value=str(rid)) for rid in role_ids[:25]]
+        )
+    async def callback(self, interaction):
+        rid = int(self.values[0])
+        if self.action == "get":
+            role = interaction.guild.get_role(rid)
+            if not role:
+                return await interaction.response.send_message("Роль більше не існує.", ephemeral=True)
+            try:
+                await interaction.user.add_roles(role)
+            except discord.HTTPException:
+                return await interaction.response.send_message("Не вдалося видати роль.", ephemeral=True)
+            conn=db(); conn.execute("DELETE FROM role_inventory WHERE user_id=? AND role_id=?", (interaction.user.id, rid)); conn.commit(); conn.close()
+            return await interaction.response.send_message(f"Роль {role.mention} видано.", ephemeral=True)
+        if self.action == "sell":
+            return await interaction.response.send_modal(RoleSellModal(rid))
+
+class InventoryView(discord.ui.View):
+    def __init__(self, role_ids):
+        super().__init__(timeout=180)
+        self.add_item(InventorySelect(role_ids, "get"))
+        self.add_item(InventorySelect(role_ids, "sell"))
 
 class RoleShopView(discord.ui.View):
-    def __init__(self): super().__init__(timeout=300)
-    @discord.ui.button(label="Оновити", emoji="🔄", style=discord.ButtonStyle.secondary)
+    def __init__(self):
+        super().__init__(timeout=300)
+
+    @discord.ui.button(label="Оновити", style=discord.ButtonStyle.secondary)
     async def refresh(self, interaction, button):
         if not normal_channel_only(interaction): return await reject_wrong_channel(interaction)
-        await interaction.response.edit_message(embed=embed("🏪 Магазин ролей", await role_shop_text(interaction.guild)), view=RoleShopView())
-    @discord.ui.button(label="Купити", emoji="💰", style=discord.ButtonStyle.success)
+        await interaction.response.edit_message(
+            embed=embed("Магазин ролей", await role_shop_text(interaction.guild)),
+            view=RoleShopView()
+        )
+
+    @discord.ui.button(label="Купити", style=discord.ButtonStyle.success)
     async def buy(self, interaction, button):
         if not normal_channel_only(interaction): return await reject_wrong_channel(interaction)
-        await interaction.response.send_modal(RoleBuyModal())
+        rows = await role_shop_rows(interaction.guild)
+        if not rows:
+            return await interaction.response.send_message("У магазині немає ролей для покупки.", ephemeral=True)
+        await interaction.response.send_message(
+            embed=embed("Купити роль", "Обери роль зі списку. ID вводити не потрібно."),
+            view=RoleBuyView(rows),
+            ephemeral=True
+        )
 
+    @discord.ui.button(label="Продати", style=discord.ButtonStyle.danger)
+    async def sell(self, interaction, button):
+        if not normal_channel_only(interaction): return await reject_wrong_channel(interaction)
+        conn=db()
+        rows=conn.execute("SELECT * FROM roles WHERE guild_id=? AND owner_id=? AND for_sale=0 ORDER BY name", (interaction.guild.id, interaction.user.id)).fetchall()
+        conn.close()
+        if not rows:
+            return await interaction.response.send_message("У тебе немає ролей, які можна виставити на продаж.", ephemeral=True)
+        await interaction.response.send_message(embed=embed("Продати роль", "Обери свою роль і вкажи ціну."), view=RoleSellView(rows), ephemeral=True)
 
-@bot.tree.command(name="role_shop", description="🏪 Переглянути та купити ролі")
+    @discord.ui.button(label="Створити", style=discord.ButtonStyle.primary)
+    async def create(self, interaction, button):
+        if not normal_channel_only(interaction): return await reject_wrong_channel(interaction)
+        await interaction.response.send_modal(RoleNameModal())
+
+@bot.tree.command(name="role_shop", description="Переглянути магазин ролей")
 async def role_shop(interaction: discord.Interaction):
     if not normal_channel_only(interaction): return await reject_wrong_channel(interaction)
-    if not interaction.guild: return await interaction.response.send_message("❌ Тільки на сервері.", ephemeral=True)
-    await interaction.response.send_message(embed=embed("🏪 Магазин ролей", await role_shop_text(interaction.guild)), view=RoleShopView())
+    if not interaction.guild: return await interaction.response.send_message("Тільки на сервері.", ephemeral=True)
+    await interaction.response.send_message(embed=embed("Магазин ролей", await role_shop_text(interaction.guild)), view=RoleShopView())
 
+@bot.tree.command(name="role_create", description="Створити власну роль")
+async def role_create(interaction: discord.Interaction):
+    if not normal_channel_only(interaction): return await reject_wrong_channel(interaction)
+    if not interaction.guild: return await interaction.response.send_message("Тільки на сервері.", ephemeral=True)
+    await interaction.response.send_modal(RoleNameModal())
 
-@bot.tree.command(name="role_sell", description="🏷️ Виставити свою роль на продаж")
+@bot.tree.command(name="role_sell", description="Виставити свою роль на продаж")
 @app_commands.describe(role="Роль", price="Ціна")
 async def role_sell(interaction: discord.Interaction, role: discord.Role, price: app_commands.Range[int, 1, MAX_BET]):
     if not normal_channel_only(interaction): return await reject_wrong_channel(interaction)
     conn = db(); row = conn.execute("SELECT * FROM roles WHERE role_id=? AND guild_id=? AND owner_id=?", (role.id, interaction.guild.id, interaction.user.id)).fetchone()
-    if not row: conn.close(); return await interaction.response.send_message("❌ Це не твоя роль, створена через бота.", ephemeral=True)
-    conn.execute("UPDATE roles SET price=?, for_sale=1 WHERE role_id=?", (price, role.id)); conn.commit(); conn.close()
-    await interaction.response.send_message(f"✅ {role.mention} виставлена на продаж за **{money(price)}** 💰.", ephemeral=True)
+    if not row:
+        conn.close(); return await interaction.response.send_message("Це не твоя роль, створена через бота.", ephemeral=True)
+    conn.execute("UPDATE roles SET price=?, for_sale=1 WHERE role_id=?", (price, role.id)); conn.execute("DELETE FROM role_inventory WHERE user_id=? AND role_id=?", (interaction.user.id, role.id)); conn.commit(); conn.close()
+    await interaction.response.send_message(f"Роль {role.mention} виставлена на продаж за **{money(price)}**.", ephemeral=True)
 
-
-@bot.tree.command(name="role_buy", description="🏷️ Купити роль за ID")
-@app_commands.describe(role_id="ID ролі з /role_shop")
-async def role_buy(interaction: discord.Interaction, role_id: str):
+@bot.tree.command(name="role_buy", description="Купити роль")
+@app_commands.describe(role="Роль")
+async def role_buy(interaction: discord.Interaction, role: discord.Role):
     if not normal_channel_only(interaction): return await reject_wrong_channel(interaction)
-    try: rid = int(role_id)
-    except ValueError: return await interaction.response.send_message("❌ Невірний ID ролі.", ephemeral=True)
-    await buy_role(interaction, rid)
+    await buy_role(interaction, role.id)
 
+@bot.tree.command(name="inventory", description="Переглянути інвентар ролей")
+async def inventory(interaction: discord.Interaction):
+    if not normal_channel_only(interaction): return await reject_wrong_channel(interaction)
+    if not interaction.guild: return await interaction.response.send_message("Тільки на сервері.", ephemeral=True)
+    await show_inventory(interaction)
 
 # ---------------- ADMIN ----------------
 
-def get_setting(key: str) -> Optional[str]:
-    conn = db(); row = conn.execute("SELECT value FROM bot_settings WHERE key=?", (key,)).fetchone(); conn.close()
-    return row["value"] if row else None
+def admin_denied(interaction):
+    return interaction.response.send_message("Немає доступу.", ephemeral=True)
 
+async def set_admin_status(actor: discord.Member, target: discord.Member, enabled: bool):
+    if not is_owner(actor.id):
+        return False, "Лише власник може призначати або знімати адміністраторів."
+    if target.id == OWNER_ID:
+        return False, "Власника не можна змінити."
+    conn = db()
+    conn.execute(
+        "INSERT OR IGNORE INTO users(user_id, username, dick_size, balance) VALUES (?, ?, ?, 0)",
+        (target.id, target.name, START_DICK_SIZE)
+    )
+    conn.execute("UPDATE users SET username=?, admin=? WHERE user_id=?", (target.name, int(enabled), target.id))
+    conn.commit(); conn.close()
+    return True, ""
 
-def set_setting(key: str, value: str):
-    conn = db(); conn.execute("INSERT INTO bot_settings(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value)); conn.commit(); conn.close()
+async def give_admin(interaction, user: discord.Member):
+    ok, reason = await set_admin_status(interaction.user, user, True)
+    if not ok:
+        return await interaction.response.send_message(reason, ephemeral=True)
 
+    role = interaction.guild.get_role(ROLE_ADMIN_ID) if interaction.guild else None
+    if role:
+        try:
+            await user.add_roles(role, reason="Призначення адміністратором ботом")
+        except discord.HTTPException:
+            pass
 
-def delete_setting(key: str):
-    conn = db(); conn.execute("DELETE FROM bot_settings WHERE key=?", (key,)); conn.commit(); conn.close()
+    server_name = interaction.guild.name if interaction.guild else "Discord сервері"
+    dm = discord.Embed(
+        title="Призначення адміністратора",
+        description=f"Вас було призначено на посаду адміністратора в діскорд сервері **{server_name}**.",
+        color=discord.Color.green()
+    )
+    try:
+        await user.send(embed=dm)
+    except discord.HTTPException:
+        pass
 
+    await interaction.response.send_message(f"Адміністратора призначено: {user.mention}.", ephemeral=True)
+
+async def take_admin(interaction, user: discord.Member):
+    ok, reason = await set_admin_status(interaction.user, user, False)
+    if not ok:
+        return await interaction.response.send_message(reason, ephemeral=True)
+
+    role = interaction.guild.get_role(ROLE_ADMIN_ID) if interaction.guild else None
+    if role:
+        try:
+            await user.remove_roles(role, reason="Зняття адміністратора ботом")
+        except discord.HTTPException:
+            pass
+    await interaction.response.send_message(f"Адміністратора знято: {user.mention}.", ephemeral=True)
 
 class GiveMoneyModal(discord.ui.Modal, title="Видати гроші"):
     user_id = discord.ui.TextInput(label="ID користувача", placeholder="123456789012345678")
     amount = discord.ui.TextInput(label="Кількість грошей", placeholder="50000")
     async def on_submit(self, interaction):
-        if not is_admin(interaction.user.id): return await interaction.response.send_message("❌ Немає доступу.", ephemeral=True)
+        if not is_admin(interaction.user.id): return await admin_denied(interaction)
         try: uid, amount = int(self.user_id.value.strip()), int(self.amount.value.strip()); assert amount > 0
-        except (ValueError, AssertionError): return await interaction.response.send_message("❌ Невірні дані.", ephemeral=True)
-        money_add(uid, amount); await interaction.response.send_message(f"✅ <@{uid}> отримав **{money(amount)}** 💰.", ephemeral=True)
-
+        except (ValueError, AssertionError): return await interaction.response.send_message("Невірні дані.", ephemeral=True)
+        money_add(uid, amount); await interaction.response.send_message(f"{uid} отримав {money(amount)}.", ephemeral=True)
 
 class SetMoneyModal(discord.ui.Modal, title="Встановити гроші"):
     user_id = discord.ui.TextInput(label="ID користувача", placeholder="123456789012345678")
     amount = discord.ui.TextInput(label="Новий баланс", placeholder="50000")
     async def on_submit(self, interaction):
-        if not is_admin(interaction.user.id): return await interaction.response.send_message("❌ Немає доступу.", ephemeral=True)
+        if not is_admin(interaction.user.id): return await admin_denied(interaction)
         try: uid, amount = int(self.user_id.value.strip()), int(self.amount.value.strip()); assert amount >= 0
-        except (ValueError, AssertionError): return await interaction.response.send_message("❌ Невірні дані.", ephemeral=True)
+        except (ValueError, AssertionError): return await interaction.response.send_message("Невірні дані.", ephemeral=True)
         old = get_user(uid)["balance"]; money_set(uid, amount)
-        await interaction.response.send_message(f"✅ Баланс <@{uid}> змінено: **{money(old)} → {money(amount)}** 💰.", ephemeral=True)
-
+        await interaction.response.send_message(f"Баланс {uid}: {money(old)} → {money(amount)}.", ephemeral=True)
 
 class SetDickModal(discord.ui.Modal, title="Встановити розмір"):
     user_id = discord.ui.TextInput(label="ID користувача", placeholder="123456789012345678")
     size = discord.ui.TextInput(label="Новий розмір", placeholder="10")
     async def on_submit(self, interaction):
-        if not is_admin(interaction.user.id): return await interaction.response.send_message("❌ Немає доступу.", ephemeral=True)
+        if not is_admin(interaction.user.id): return await admin_denied(interaction)
         try: uid, size = int(self.user_id.value.strip()), int(self.size.value.strip())
-        except ValueError: return await interaction.response.send_message("❌ Невірні дані.", ephemeral=True)
+        except ValueError: return await interaction.response.send_message("Невірні дані.", ephemeral=True)
         old = get_user(uid)["dick_size"]; dick_set(uid, size)
-        await interaction.response.send_message(f"✅ Розмір <@{uid}> змінено: **{old} см → {size} см**.", ephemeral=True)
-
+        await interaction.response.send_message(f"Розмір {uid}: {old} см → {size} см.", ephemeral=True)
 
 class RigRouletteModal(discord.ui.Modal, title="Накрутка рулетки"):
-    number = discord.ui.TextInput(label="Наступне число (0-36)", placeholder="Наприклад: 17")
+    number = discord.ui.TextInput(label="Наступне число (1-50)", placeholder="17")
     async def on_submit(self, interaction):
-        if not is_admin(interaction.user.id): return await interaction.response.send_message("❌ Немає доступу.", ephemeral=True)
-        try: n = int(self.number.value.strip()); assert 0 <= n <= 36
-        except (ValueError, AssertionError): return await interaction.response.send_message("❌ Вкажи число від 0 до 36.", ephemeral=True)
-        set_setting("roulette_next", str(n)); await interaction.response.send_message(f"🎰 Наступного разу рулетка примусово покаже **{n}**.", ephemeral=True)
-
+        if not is_admin(interaction.user.id): return await admin_denied(interaction)
+        try: n = int(self.number.value.strip()); assert 1 <= n <= 50
+        except (ValueError, AssertionError): return await interaction.response.send_message("Невірне число.", ephemeral=True)
+        set_setting("roulette_next", str(n)); await interaction.response.send_message(f"Наступного разу рулетка спробує показати {n}.", ephemeral=True)
 
 class RigCoinModal(discord.ui.Modal, title="Накрутка монетки"):
     result = discord.ui.TextInput(label="Наступний результат", placeholder="Орел або Решка")
     async def on_submit(self, interaction):
-        if not is_admin(interaction.user.id): return await interaction.response.send_message("❌ Немає доступу.", ephemeral=True)
+        if not is_admin(interaction.user.id): return await admin_denied(interaction)
         value = self.result.value.strip().lower()
         mapping = {"орел": "Орел", "решка": "Решка", "heads": "Орел", "tails": "Решка"}
-        if value not in mapping: return await interaction.response.send_message("❌ Напиши `Орел` або `Решка`.", ephemeral=True)
-        set_setting("coinflip_next", mapping[value]); await interaction.response.send_message(f"🪙 Наступного разу монетка покаже **{mapping[value]}**.", ephemeral=True)
+        if value not in mapping: return await interaction.response.send_message("Напиши Орел або Решка.", ephemeral=True)
+        set_setting("coinflip_next", mapping[value]); await interaction.response.send_message(f"Наступного разу монетка покаже {mapping[value]}.", ephemeral=True)
 
+class AdminUserModal(discord.ui.Modal, title="Призначити адміністратора"):
+    user_id = discord.ui.TextInput(label="ID користувача", placeholder="123456789012345678")
+    async def on_submit(self, interaction):
+        if not is_owner(interaction.user.id): return await admin_denied(interaction)
+        try: uid=int(self.user_id.value.strip())
+        except ValueError: return await interaction.response.send_message("Невірний ID.", ephemeral=True)
+        member=interaction.guild.get_member(uid)
+        if not member:
+            return await interaction.response.send_message("Користувача не знайдено на сервері.", ephemeral=True)
+        await give_admin(interaction, member)
+
+class TakeAdminModal(discord.ui.Modal, title="Зняти адміністратора"):
+    user_id = discord.ui.TextInput(label="ID користувача", placeholder="123456789012345678")
+    async def on_submit(self, interaction):
+        if not is_owner(interaction.user.id): return await admin_denied(interaction)
+        try: uid=int(self.user_id.value.strip())
+        except ValueError: return await interaction.response.send_message("Невірний ID.", ephemeral=True)
+        member=interaction.guild.get_member(uid)
+        if not member:
+            return await interaction.response.send_message("Користувача не знайдено на сервері.", ephemeral=True)
+        await take_admin(interaction, member)
+
+class MsgSendModal(discord.ui.Modal, title="Надіслати повідомлення користувачу в лс"):
+    user = discord.ui.TextInput(label="Нік користувача або Discord ID", placeholder="username або 123456789012345678")
+    text = discord.ui.TextInput(label="Текст повідомлення", style=discord.TextStyle.paragraph, max_length=4000)
+    attachment_url = discord.ui.TextInput(label="Посилання на фото/відео (необов'язково)", required=False, placeholder="https://...")
+    async def on_submit(self, interaction):
+        if not is_admin(interaction.user.id): return await admin_denied(interaction)
+        member = await resolve_member(interaction.guild, str(self.user.value).strip())
+        if not member:
+            return await interaction.response.send_message("Користувача не знайдено. Вкажи нік або Discord ID.", ephemeral=True)
+        e = discord.Embed(title="Повідомлення", description=str(self.text.value), color=discord.Color.blurple())
+        if self.attachment_url.value.strip():
+            e.set_image(url=self.attachment_url.value.strip())
+        try:
+            await member.send(embed=e)
+        except discord.HTTPException:
+            return await interaction.response.send_message("Не вдалося надіслати повідомлення в особисті повідомлення.", ephemeral=True)
+        await interaction.response.send_message(f"Повідомлення надіслано {member.mention}.", ephemeral=True)
+
+async def resolve_member(guild, value):
+    value=value.strip()
+    if value.isdigit():
+        return guild.get_member(int(value))
+    value=value.lstrip("@")
+    lower=value.lower()
+    for m in guild.members:
+        if m.name.lower()==lower or m.display_name.lower()==lower or str(m).lower()==lower:
+            return m
+    return None
 
 class AdminView(discord.ui.View):
-    def __init__(self): super().__init__(timeout=600)
+    def __init__(self):
+        super().__init__(timeout=600)
+
     async def check(self, interaction):
         if not is_admin(interaction.user.id):
-            await interaction.response.send_message("❌ Немає доступу.", ephemeral=True); return False
+            await admin_denied(interaction); return False
         return True
-    @discord.ui.button(label="Видати гроші", emoji="💸", style=discord.ButtonStyle.success, row=0)
+
+    @discord.ui.button(label="Видати гроші", style=discord.ButtonStyle.success, row=0)
     async def give_money(self, interaction, button):
         if await self.check(interaction): await interaction.response.send_modal(GiveMoneyModal())
-    @discord.ui.button(label="Встановити гроші", emoji="💰", style=discord.ButtonStyle.primary, row=0)
+
+    @discord.ui.button(label="Встановити гроші", style=discord.ButtonStyle.primary, row=0)
     async def set_money(self, interaction, button):
         if await self.check(interaction): await interaction.response.send_modal(SetMoneyModal())
-    @discord.ui.button(label="Встановити розмір", emoji="🍆", style=discord.ButtonStyle.primary, row=0)
+
+    @discord.ui.button(label="Встановити розмір", style=discord.ButtonStyle.primary, row=0)
     async def set_dick(self, interaction, button):
         if await self.check(interaction): await interaction.response.send_modal(SetDickModal())
-    @discord.ui.button(label="Накрутка рулетки", emoji="🎰", style=discord.ButtonStyle.danger, row=1)
+
+    @discord.ui.button(label="Накрутка рулетки", style=discord.ButtonStyle.danger, row=1)
     async def rig_roulette(self, interaction, button):
         if await self.check(interaction): await interaction.response.send_modal(RigRouletteModal())
-    @discord.ui.button(label="Накрутка монетки", emoji="🪙", style=discord.ButtonStyle.danger, row=1)
+
+    @discord.ui.button(label="Накрутка монетки", style=discord.ButtonStyle.danger, row=1)
     async def rig_coin(self, interaction, button):
         if await self.check(interaction): await interaction.response.send_modal(RigCoinModal())
 
+    @discord.ui.button(label="Призначити адміністратора", style=discord.ButtonStyle.primary, row=2)
+    async def give_admin_btn(self, interaction, button):
+        if not is_owner(interaction.user.id):
+            return await admin_denied(interaction)
+        await interaction.response.send_modal(AdminUserModal())
 
-@bot.tree.command(name="admin", description="🔒 Адмін-панель (тільки для адмінів)")
+    @discord.ui.button(label="Зняти адміністратора", style=discord.ButtonStyle.danger, row=2)
+    async def take_admin_btn(self, interaction, button):
+        if not is_owner(interaction.user.id):
+            return await admin_denied(interaction)
+        await interaction.response.send_modal(TakeAdminModal())
+
+    @discord.ui.button(label="Надіслати повідомлення", style=discord.ButtonStyle.secondary, row=3)
+    async def msg_send_btn(self, interaction, button):
+        if await self.check(interaction):
+            await interaction.response.send_modal(MsgSendModal())
+
+@bot.tree.command(name="admin", description="🔒 Адмін-панель")
 async def admin(interaction: discord.Interaction):
-    if not is_admin(interaction.user.id): return await interaction.response.send_message("❌ Немає доступу.", ephemeral=True)
-    await interaction.response.send_message(embed=embed("🛠️ Адмін-панель", "🔒 **Ця панель доступна тільки адміністраторам.**\n\nОбери потрібну дію нижче.", discord.Color.dark_red()), view=AdminView(), ephemeral=True)
-
-
-@bot.tree.command(name="givemoney", description="🔒 Адмін: видати гроші користувачу")
-@app_commands.describe(user="Користувач", amount="Кількість")
-async def givemoney(interaction: discord.Interaction, user: discord.Member, amount: app_commands.Range[int, 1, MAX_BET]):
-    if not is_admin(interaction.user.id): return await interaction.response.send_message("❌ Немає доступу.", ephemeral=True)
-    money_add(user.id, amount); await interaction.response.send_message(f"✅ {user.mention} отримав **{money(amount)}** 💰.", ephemeral=True)
-
-
-@bot.tree.command(name="setmoney", description="🔒 Адмін: встановити баланс користувачу")
-@app_commands.describe(user="Користувач", amount="Новий баланс")
-async def setmoney(interaction: discord.Interaction, user: discord.Member, amount: app_commands.Range[int, 0, MAX_BET]):
-    if not is_admin(interaction.user.id): return await interaction.response.send_message("❌ Немає доступу.", ephemeral=True)
-    old = get_user(user.id, user.name)["balance"]; money_set(user.id, amount)
-    await interaction.response.send_message(f"✅ Баланс {user.mention}: **{money(old)} → {money(amount)}** 💰.", ephemeral=True)
-
-
-@bot.tree.command(name="setdick", description="🔒 Адмін: встановити розмір користувачу")
-@app_commands.describe(user="Користувач", size="Новий розмір")
-async def setdick(interaction: discord.Interaction, user: discord.Member, size: int):
-    if not is_admin(interaction.user.id): return await interaction.response.send_message("❌ Немає доступу.", ephemeral=True)
-    old = get_user(user.id, user.name)["dick_size"]; dick_set(user.id, size)
-    await interaction.response.send_message(f"✅ Розмір {user.mention}: **{old} см → {size} см**.", ephemeral=True)
-
-
-@bot.tree.command(name="setadmin", description="🔒 Адмін: видати або забрати адмін-права")
-@app_commands.describe(user="Користувач", enabled="True — видати, False — забрати")
-async def setadmin(interaction: discord.Interaction, user: discord.Member, enabled: bool):
-    if not is_admin(interaction.user.id):
-        return await interaction.response.send_message("❌ Немає доступу.", ephemeral=True)
-    conn = db()
-    conn.execute("INSERT OR IGNORE INTO users(user_id, username, dick_size, balance) VALUES (?, ?, ?, 0)", (user.id, user.name, START_DICK_SIZE))
-    conn.execute("UPDATE users SET username=?, admin=? WHERE user_id=?", (user.name, int(enabled), user.id))
-    conn.commit(); conn.close()
+    if not is_admin(interaction.user.id): return await admin_denied(interaction)
     await interaction.response.send_message(
-        f"{'✅ Адмін-права видано' if enabled else '🛑 Адмін-права забрано'}: {user.mention}.", ephemeral=True
+        embed=embed("Адмін-панель", "Панель доступна адміністраторам.\nВласник також може призначати та знімати адміністраторів.", discord.Color.dark_red()),
+        view=AdminView(), ephemeral=True
     )
 
+@bot.tree.command(name="givemoney", description="🔒 Видати гроші користувачу")
+@app_commands.describe(user="Користувач", amount="Кількість")
+async def givemoney(interaction: discord.Interaction, user: discord.Member, amount: app_commands.Range[int, 1, MAX_BET]):
+    if not is_admin(interaction.user.id): return await admin_denied(interaction)
+    money_add(user.id, amount); await interaction.response.send_message(f"{user.mention} отримав {money(amount)}.", ephemeral=True)
 
-@bot.tree.command(name="promo_create", description="🔒 Адмін: створити промокод")
+@bot.tree.command(name="setmoney", description="🔒 Встановити баланс користувачу")
+@app_commands.describe(user="Користувач", amount="Новий баланс")
+async def setmoney(interaction: discord.Interaction, user: discord.Member, amount: app_commands.Range[int, 0, MAX_BET]):
+    if not is_admin(interaction.user.id): return await admin_denied(interaction)
+    old = get_user(user.id, user.name)["balance"]; money_set(user.id, amount)
+    await interaction.response.send_message(f"Баланс {user.mention}: {money(old)} → {money(amount)}.", ephemeral=True)
+
+@bot.tree.command(name="setdick", description="🔒 Встановити розмір користувачу")
+@app_commands.describe(user="Користувач", size="Новий розмір")
+async def setdick(interaction: discord.Interaction, user: discord.Member, size: int):
+    if not is_admin(interaction.user.id): return await admin_denied(interaction)
+    old = get_user(user.id, user.name)["dick_size"]; dick_set(user.id, size)
+    await interaction.response.send_message(f"Розмір {user.mention}: {old} см → {size} см.", ephemeral=True)
+
+@bot.tree.command(name="giveadmin", description="🔒 Призначити адміністратора")
+@app_commands.describe(user="Користувач")
+async def giveadmin(interaction: discord.Interaction, user: discord.Member):
+    if not is_owner(interaction.user.id): return await admin_denied(interaction)
+    await give_admin(interaction, user)
+
+@bot.tree.command(name="takeadmin", description="🔒 Зняти адміністратора")
+@app_commands.describe(user="Користувач")
+async def takeadmin(interaction: discord.Interaction, user: discord.Member):
+    if not is_owner(interaction.user.id): return await admin_denied(interaction)
+    await take_admin(interaction, user)
+
+@bot.tree.command(name="setadmin", description="🔒 Змінити статус адміністратора")
+@app_commands.describe(user="Користувач", enabled="True — видати, False — забрати")
+async def setadmin(interaction: discord.Interaction, user: discord.Member, enabled: bool):
+    if not is_owner(interaction.user.id):
+        return await admin_denied(interaction)
+    if enabled:
+        await give_admin(interaction, user)
+    else:
+        await take_admin(interaction, user)
+
+@bot.tree.command(name="msg_send", description="🔒 Надіслати повідомлення користувачу в лс")
+@app_commands.describe(user="Користувач", text="Текст", attachment="Фото або відео")
+async def msg_send(interaction: discord.Interaction, user: discord.Member, text: str, attachment: Optional[discord.Attachment] = None):
+    if not is_admin(interaction.user.id): return await admin_denied(interaction)
+    try:
+        if attachment:
+            await user.send(content=text, file=await attachment.to_file())
+        else:
+            await user.send(content=text)
+    except discord.HTTPException:
+        return await interaction.response.send_message("Не вдалося надіслати повідомлення в особисті повідомлення.", ephemeral=True)
+    await interaction.response.send_message(f"Повідомлення надіслано {user.mention}.", ephemeral=True)
+
+@bot.tree.command(name="promo_create", description="🔒 Створити промокод")
 @app_commands.describe(code="Код", money_amount="Гроші", dick_amount="Скільки см")
 async def promo_create(interaction: discord.Interaction, code: str, money_amount: app_commands.Range[int, 0, MAX_BET], dick_amount: int):
-    if not is_admin(interaction.user.id): return await interaction.response.send_message("❌ Немає доступу.", ephemeral=True)
+    if not is_admin(interaction.user.id): return await admin_denied(interaction)
     code = code.strip().upper()
     conn = db()
     try:
         conn.execute("INSERT INTO promos(code, money, dick, created_by) VALUES (?, ?, ?, ?)", (code, money_amount, dick_amount, interaction.user.id)); conn.commit()
     except sqlite3.IntegrityError:
-        conn.close(); return await interaction.response.send_message("❌ Такий промокод уже існує.", ephemeral=True)
-    conn.close(); await interaction.response.send_message(f"✅ Промокод **{code}** створено!\n💰 +{money(money_amount)}\n🍆 {dick_amount:+d} см", ephemeral=True)
-
+        conn.close(); return await interaction.response.send_message("Такий промокод уже існує.", ephemeral=True)
+    conn.close(); await interaction.response.send_message(f"Промокод {code} створено. +{money(money_amount)}, {dick_amount:+d} см.", ephemeral=True)
 
 # ---------------- START ----------------
 
