@@ -1889,6 +1889,19 @@ async def role_buy(interaction: discord.Interaction, role: discord.Role):
 
 # ---------------- CASES ----------------
 
+@bot.tree.command(name="case", description="Відкрити магазин кейсів")
+async def case(interaction: discord.Interaction):
+    if not normal_channel_only(interaction):
+        return await reject_wrong_channel(interaction)
+    await interaction.response.send_message(
+        embed=embed(
+            "🎁 Магазин кейсів",
+            "Обери кейс, який хочеш придбати. Після покупки його можна відкрити одразу або зберегти в /inventory.",
+            discord.Color.gold()
+        ),
+        view=CaseMainView()
+    )
+
 class CaseMainView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=300)
