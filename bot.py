@@ -268,9 +268,18 @@ def _migrate_schema(conn):
             "created_at": "TEXT NOT NULL DEFAULT ''",
             "active_car": "TEXT",
             "primary_house": "TEXT",
+            "active_business": "TEXT",
+            "garage_type": "TEXT",
+            "garage_purchased_at": "TEXT",
+            "garage_offer_sent_at": "TEXT",
+            "garage_offer_deadline": "TEXT",
+            "garage_reminder_at": "TEXT",
+            "garage_last_check_at": "TEXT",
+            "bank_banned": "INTEGER NOT NULL DEFAULT 0",
         },
         "promos": {"created_at": "TEXT NOT NULL DEFAULT ''"},
         "promo_uses": {"used_at": "TEXT NOT NULL DEFAULT ''"},
+        "loans": {"reminder_at": "TEXT"},
     }
     for table, columns in migrations.items():
         existing = _table_columns(conn, table)
@@ -524,7 +533,56 @@ def init_db():
         finishes_at TEXT NOT NULL,
         reward INTEGER NOT NULL,
         status TEXT NOT NULL DEFAULT 'running',
-        finished_at TEXT
+        finished_at TEXT,
+        channel_id INTEGER
+    );
+
+    CREATE TABLE IF NOT EXISTS businesses (
+        business_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        business_name TEXT NOT NULL,
+        price INTEGER NOT NULL,
+        hourly_profit INTEGER NOT NULL,
+        purchased_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        last_paid_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS garage_events (
+        event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        event_type TEXT NOT NULL,
+        event_at TEXT NOT NULL,
+        details TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS loans (
+        loan_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        lender_id INTEGER NOT NULL,
+        borrower_id INTEGER NOT NULL,
+        principal INTEGER NOT NULL,
+        rate REAL NOT NULL,
+        total_due INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        due_at TEXT NOT NULL,
+        grace_until TEXT,
+        status TEXT NOT NULL DEFAULT 'active',
+        due_notice_sent_at TEXT,
+        reminder_at TEXT,
+        closed_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS loan_offers (
+        offer_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        proposer_id INTEGER NOT NULL,
+        counterparty_id INTEGER NOT NULL,
+        lender_id INTEGER NOT NULL,
+        borrower_id INTEGER NOT NULL,
+        principal INTEGER NOT NULL,
+        rate REAL NOT NULL,
+        days INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
 
     CREATE TABLE IF NOT EXISTS cookie_games (
@@ -794,6 +852,8 @@ async def profile(interaction: discord.Interaction, user: discord.Member | None 
     e.add_field(name="💰 Баланс", value=f"**{money(u['balance'])}**", inline=True)
     e.add_field(name="🚗 Автомобіль", value=f"**{u['active_car'] or 'немає'}**", inline=False)
     e.add_field(name="🏠 Дім", value=f"**{u['primary_house'] or 'немає'}**", inline=False)
+    e.add_field(name="🏢 Бізнес", value=f"**{u['active_business'] or 'немає'}**", inline=False)
+    e.add_field(name="🚘 Гараж", value=f"**{u['garage_type'] or 'немає'}**", inline=False)
     await interaction.response.send_message(embed=e)
 
 
@@ -1440,19 +1500,6 @@ async def pecenka(message: discord.Message):
         game["task"] = asyncio.create_task(start_cookie_game(game))
     else:
         await message.channel.send(f"🍪 <@{message.author.id}> готовий. Чекаємо другого гравця — напиши `!pecenka`.")
-
-
-@bot.event
-async def on_message(message: discord.Message):
-    if message.author.bot:
-        return
-    game = cookie_games.get(message.channel.id)
-    if game and game["status"] == "playing" and message.author.id in game["scores"]:
-        game["scores"][message.author.id] += len(message.content)
-        conn = db()
-        conn.execute("UPDATE cookie_games SET proposer_score=?, opponent_score=? WHERE channel_id=?", (game["scores"][game['proposer_id']], game["scores"][game['opponent_id']], game["channel_id"]))
-        conn.commit(); conn.close()
-    await bot.process_commands(message)
 
 
 # ---------------- ROLES ----------------
@@ -2105,6 +2152,9 @@ class CarResultView(discord.ui.View):
             embed=embed("🚗 Машину забрано", f"**{self.car_name}** додано до твого інвентарю.\n\nПеревір `/inventory` або профіль.", discord.Color.green()),
             view=self
         )
+        # Immediately offer a garage in DM; the background loop also catches
+        # cars acquired while the bot was offline.
+        await send_garage_offer(interaction.user.id)
 
     @discord.ui.button(label="Продати", emoji="💰", style=discord.ButtonStyle.danger)
     async def sell(self, interaction: discord.Interaction, button):
@@ -2156,6 +2206,9 @@ class InventoryUseView(discord.ui.View):
             elif item_type == "house":
                 label = f"🏠 {r['item_key']}"
                 description = f"Кількість: {r['quantity']} • зробити основним"
+            elif item_type == "business":
+                label = f"🏢 {r['item_key']}"
+                description = f"Кількість: {r['quantity']} • зробити активним"
             else:
                 label = f"📦 {r['item_key']}"
                 description = f"Кількість: {r['quantity']}"
@@ -2265,6 +2318,22 @@ class InventoryUseView(discord.ui.View):
             )
             return
 
+        if item_type == "business":
+            # Only one active business; switching is done here.
+            if item_key not in BUSINESS_BY_NAME:
+                return await interaction.response.send_message("❌ Невідомий бізнес.", ephemeral=True)
+            conn=db()
+            conn.execute("UPDATE users SET active_business=? WHERE user_id=?", (item_key,self.user_id))
+            conn.execute("UPDATE businesses SET last_paid_at=? WHERE user_id=? AND business_name=?",
+                         (datetime.now(timezone.utc).isoformat(),self.user_id,item_key))
+            conn.commit(); conn.close()
+            await interaction.response.send_message(
+                embed=embed("🏢 Активний бізнес змінено",
+                    f"Тепер твій активний бізнес: **{item_key}**.\n\n"
+                    "Одночасно приносить прибуток лише один бізнес. Інші залишаються в інвентарі.",
+                    discord.Color.green()), ephemeral=True)
+            return
+
         await interaction.response.send_message(
             "ℹ️ Для цього предмета поки немає дії використання.", ephemeral=True
         )
@@ -2284,6 +2353,9 @@ async def inventory(interaction: discord.Interaction):
             label = f"🚗 **{r['item_key']}** — {r['quantity']} шт. • ⚙️ можна використати"
         elif r["item_type"] == "house":
             label = f"🏠 **{r['item_key']}** — {r['quantity']} шт. • ⚙️ можна використати"
+        elif r["item_type"] == "business":
+            active = " • 🟢 активний" if get_user(interaction.user.id)["active_business"] == r["item_key"] else ""
+            label = f"🏢 **{r['item_key']}** — {r['quantity']} шт. • ⚙️ можна використати{active}"
         else:
             label = f"📦 **{r['item_key']}** — {r['quantity']} шт."
         parts.append(label)
@@ -2390,6 +2462,8 @@ class MarketView(discord.ui.View):
         await interaction.response.send_message(embed=embed("🛒 Покупку завершено",
             f"Ти придбав **{listing['item_key']}** у <@{listing['seller_id']}> за **{money(listing['price'])}** 💰.",
             discord.Color.green()), ephemeral=True)
+        if listing["item_type"] == "car":
+            await send_garage_offer(interaction.user.id)
 
 @bot.tree.command(name="market", description="Ринок гравців: купівля та перегляд оголошень")
 async def market(interaction: discord.Interaction):
@@ -2662,6 +2736,16 @@ async def guess_command(interaction: discord.Interaction, number: app_commands.R
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot: return
+
+    # Cookie game scoring must remain active even though this is the final on_message handler.
+    cookie_game = cookie_games.get(message.channel.id)
+    if cookie_game and cookie_game["status"] == "playing" and message.author.id in cookie_game["scores"]:
+        cookie_game["scores"][message.author.id] += len(message.content)
+        conn = db()
+        conn.execute("UPDATE cookie_games SET proposer_score=?, opponent_score=? WHERE channel_id=?",
+                     (cookie_game["scores"][cookie_game["proposer_id"]], cookie_game["scores"][cookie_game["opponent_id"]], cookie_game["channel_id"]))
+        conn.commit(); conn.close()
+
     conn = db(); row = conn.execute("SELECT * FROM number_games WHERE channel_id=? AND status='playing'", (message.channel.id,)).fetchone(); conn.close()
     if row and message.content.strip().isdigit():
         try: await message.delete()
@@ -2686,10 +2770,15 @@ async def finish_masturbation_session(session_id: int):
         conn.execute("UPDATE masturbation_sessions SET status='finished', finished_at=? WHERE session_id=?",
                      (datetime.now(timezone.utc).isoformat(),session_id))
         conn.commit()
-        user=bot.get_user(row["user_id"])
-        if user:
+        # Completion is public in the same channel where /masturbation was started.
+        channel = bot.get_channel(row["channel_id"]) if row["channel_id"] else None
+        if channel:
             try:
-                await user.send(embed=embed("💰 Бонус отримано!",f"Ти закінчив. Твій бонус: **{money(row['reward'])}** 💰.",discord.Color.green()))
+                await channel.send(embed=embed(
+                    "💰 Активність завершена!",
+                    f"<@{row['user_id']}> завершив активність та отримав бонус **{money(row['reward'])}** 💰.",
+                    discord.Color.green()
+                ))
             except discord.HTTPException:
                 pass
     finally: conn.close()
@@ -2725,8 +2814,8 @@ async def masturbation(interaction: discord.Interaction):
         now=datetime.now(timezone.utc)
         finishes=now+timedelta(seconds=MASTURBATION_DURATION)
         reward=random.randint(5_000,15_000)
-        cur=conn.execute("""INSERT INTO masturbation_sessions(user_id,started_at,finishes_at,reward,status)
-                            VALUES(?,?,?,?, 'running')""",(interaction.user.id,now.isoformat(),finishes.isoformat(),reward))
+        cur=conn.execute("""INSERT INTO masturbation_sessions(user_id,started_at,finishes_at,reward,status,channel_id)
+                            VALUES(?,?,?,?, 'running', ?)""",(interaction.user.id,now.isoformat(),finishes.isoformat(),reward,interaction.channel_id))
         session_id=cur.lastrowid
         conn.commit()
     finally: conn.close()
@@ -2734,6 +2823,742 @@ async def masturbation(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed("⏳ Активність розпочато",
         "Ти почав. Коли завершиш, отримаєш випадковий бонус **від 5 000 до 15 000 💰**.\n\n⏱️ Тривалість: **30 секунд**.\n🔁 Повторити можна **раз на 2 години**.",discord.Color.blurple()),ephemeral=False)
 
+
+
+# ============================================================
+# BUSINESSES / GARAGES / BANK / LOANS
+# ============================================================
+
+BUSINESSES = [
+    ("Мережа кав'ярень (Зернятко)", 5_000_000, 18_000),
+    ("Спортивний комплекс (Viking)", 8_000_000, 30_000),
+    ("Приватна школа (Step School)", 12_000_000, 46_000),
+    ("Мережа автомийок самообслуговування (LuxWash)", 15_000_000, 59_000),
+    ("IT-академія (IT STEP)", 20_000_000, 81_000),
+    ("Мережа кінотеатрів (Планета Кіно)", 25_000_000, 103_000),
+    ("Мережа заправок (OKKO)", 30_000_000, 125_000),
+    ("Логістичний центр (Укр пошта)", 35_000_000, 148_000),
+    ("Приватна лікарня (Добробут)", 45_000_000, 195_000),
+    ("Мережа супермаркетів (Сільпо)", 55_000_000, 245_000),
+    ("Торговий центр (Епіцентр)", 70_000_000, 320_000),
+    ("Служба доставки (Нова Пошта)", 85_000_000, 398_000),
+    ("Завод напоїв (Оболонь)", 100_000_000, 480_000),
+    ("Міжнародний Аеропорт (Київ)", 125_000_000, 615_000),
+    ("Мобільний оператор (Київстар)", 150_000_000, 760_000),
+]
+BUSINESS_BY_NAME = {x[0]: x for x in BUSINESSES}
+
+GARAGES = {
+    "Звичайний": {"price": 50_000, "risk": 0.10, "description": "Публічний гараж у центрі міста"},
+    "Середній": {"price": 250_000, "risk": 0.02, "description": "Гараж на підземній парковці"},
+    "Надійний": {"price": 1_000_000, "risk": 0.00001, "description": "Гараж на підземній парковці Банку"},
+}
+GARAGE_OFFER_HOURS = 24
+GARAGE_CHECK_INTERVAL = 300  # 5 min; missed hours/days are caught up after restart.
+BANK_MIN = 1_000
+BANK_MAX = 100_000_000
+
+def bank_rate(amount: int) -> float:
+    # 0.1% at 1,000 and 10% at 100,000,000, linearly interpolated.
+    amount = max(BANK_MIN, min(BANK_MAX, amount))
+    return round(0.1 + (amount - BANK_MIN) * 9.9 / (BANK_MAX - BANK_MIN), 4)
+
+def loan_total(principal: int, rate: float) -> int:
+    return int(round(principal * (1 + rate / 100)))
+
+def parse_days(value: str, minimum=1, maximum=365):
+    try:
+        n = int(str(value).strip())
+        if not minimum <= n <= maximum:
+            return None
+        return n
+    except (TypeError, ValueError):
+        return None
+
+async def safe_dm(user_id: int, *, embed_obj=None, content=None, view=None):
+    user = bot.get_user(user_id)
+    if user is None:
+        try:
+            user = await bot.fetch_user(user_id)
+        except discord.HTTPException:
+            return False
+    try:
+        await user.send(content=content, embed=embed_obj, view=view)
+        return True
+    except discord.HTTPException:
+        return False
+
+async def send_garage_offer(user_id: int):
+    conn = db()
+    row = conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
+    if not row or not row["active_car"] or row["garage_type"]:
+        conn.close()
+        return False
+    now = datetime.now(timezone.utc)
+    deadline = now + timedelta(hours=GARAGE_OFFER_HOURS)
+    conn.execute("""UPDATE users SET garage_offer_sent_at=?, garage_offer_deadline=?, garage_reminder_at=?
+                    WHERE user_id=? AND active_car IS NOT NULL AND garage_type IS NULL
+                    AND garage_offer_sent_at IS NULL""",
+                 (now.isoformat(), deadline.isoformat(), (now + timedelta(hours=1)).isoformat(), user_id))
+    conn.commit()
+    conn.close()
+
+    view = GarageOfferView(user_id)
+    ok = await safe_dm(user_id, embed_obj=embed(
+        "🚗 Захист автомобіля",
+        f"У твоєму інвентарі є автомобіль **{row['active_car']}**.\n\n"
+        "У тебе є **24 години**, щоб придбати гараж для своєї машини. "
+        "Гараж захистить автомобіль, але навіть у ньому існує невеликий ризик викрадення.\n\n"
+        "Обери дію нижче.",
+        discord.Color.orange()
+    ), view=view)
+    if not ok:
+        conn = db()
+        conn.execute("UPDATE users SET garage_offer_sent_at=NULL, garage_offer_deadline=NULL, garage_reminder_at=NULL WHERE user_id=?",
+                     (user_id,))
+        conn.commit(); conn.close()
+    return ok
+
+async def garage_reminder(user_id: int):
+    conn = db()
+    row = conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
+    conn.close()
+    if not row or not row["active_car"] or row["garage_type"]:
+        return
+    await safe_dm(user_id, embed_obj=embed(
+        "⏰ Нагадування про гараж",
+        f"Ти ще не придбав гараж для **{row['active_car']}**.\n\n"
+        "У тебе все ще є час захистити автомобіль. Відкрий попереднє повідомлення та натисни **«Купити»**.",
+        discord.Color.orange()
+    ))
+
+class GarageOfferView(discord.ui.View):
+    def __init__(self, owner_id: int):
+        super().__init__(timeout=24 * 60 * 60)
+        self.owner_id = owner_id
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("❌ Це меню призначене власнику автомобіля.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Купити", emoji="🟢", style=discord.ButtonStyle.success)
+    async def buy(self, interaction, button):
+        u = get_user(interaction.user.id, interaction.user.name)
+        if not u["active_car"]:
+            return await interaction.response.send_message("❌ У тебе немає активного автомобіля.", ephemeral=True)
+        if u["garage_type"]:
+            return await interaction.response.send_message("❌ У тебе вже є гараж.", ephemeral=True)
+        deadline = parse_time(u["garage_offer_deadline"])
+        if deadline and deadline < datetime.now(timezone.utc):
+            return await interaction.response.send_message(
+                "❌ 24 години на придбання гаража вже минули.", ephemeral=True)
+        await interaction.response.edit_message(
+            embed=embed("🏢 Вибір гаража",
+                "Обери гараж для свого автомобіля:\n\n"
+                "🏠 **Звичайний** — публічний гараж у центрі міста.\n"
+                "🅿️ **Середній** — підземна парковка.\n"
+                "🏦 **Надійний** — підземна парковка Банку.\n\n"
+                "⚠️ Ризик викрадення перевіряється щодня.",
+                discord.Color.blurple()),
+            view=GarageChoiceView(self.owner_id)
+        )
+
+    @discord.ui.button(label="Нагадати через 1 год.", emoji="⏰", style=discord.ButtonStyle.danger)
+    async def remind(self, interaction, button):
+        conn = db()
+        conn.execute("UPDATE users SET garage_reminder_at=? WHERE user_id=?",
+                     ((datetime.now(timezone.utc)+timedelta(hours=1)).isoformat(), self.owner_id))
+        conn.commit(); conn.close()
+        for item in self.children: item.disabled = True
+        await interaction.response.edit_message(
+            embed=embed("⏰ Нагадування встановлено",
+                        "Добре. Я нагадаю тобі про гараж через **1 годину**.", discord.Color.orange()),
+            view=self
+        )
+
+class GarageChoiceView(discord.ui.View):
+    def __init__(self, owner_id: int):
+        super().__init__(timeout=600)
+        self.owner_id = owner_id
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("❌ Це меню належить іншому гравцю.", ephemeral=True)
+            return False
+        return True
+
+    async def buy_garage(self, interaction, garage_type):
+        u = get_user(interaction.user.id, interaction.user.name)
+        data = GARAGES[garage_type]
+        if u["garage_type"]:
+            return await interaction.response.send_message("❌ У тебе вже є гараж.", ephemeral=True)
+        if u["balance"] < data["price"]:
+            return await interaction.response.send_message(
+                f"❌ Недостатньо грошей. Потрібно **{money(data['price'])}** 💰.", ephemeral=True)
+        if not money_add(interaction.user.id, -data["price"]):
+            return await interaction.response.send_message("❌ Не вдалося списати кошти.", ephemeral=True)
+        now = datetime.now(timezone.utc).isoformat()
+        conn = db()
+        conn.execute("""UPDATE users SET garage_type=?, garage_purchased_at=?,
+                        garage_last_check_at=?, garage_offer_deadline=NULL, garage_reminder_at=NULL
+                        WHERE user_id=?""", (garage_type, now, now, interaction.user.id))
+        conn.commit(); conn.close()
+        for item in self.children: item.disabled = True
+        await interaction.response.edit_message(
+            embed=embed("🅿️ Гараж придбано",
+                f"Твій автомобіль **{u['active_car']}** тепер зберігається у гаражі **{garage_type}**.\n\n"
+                f"💰 Вартість: **{money(data['price'])}**\n"
+                f"🛡️ Шанс викрадення на день: **{data['risk']*100:g}%**",
+                discord.Color.green()), view=self)
+
+    @discord.ui.button(label="Звичайний | 50 тис.", emoji="🏠", style=discord.ButtonStyle.secondary)
+    async def common(self, interaction, button): await self.buy_garage(interaction, "Звичайний")
+
+    @discord.ui.button(label="Середній | 250 тис.", emoji="🅿️", style=discord.ButtonStyle.primary)
+    async def medium(self, interaction, button): await self.buy_garage(interaction, "Середній")
+
+    @discord.ui.button(label="Надійний | 1 мільйон", emoji="🏦", style=discord.ButtonStyle.success)
+    async def reliable(self, interaction, button): await self.buy_garage(interaction, "Надійний")
+
+async def process_garages():
+    now = datetime.now(timezone.utc)
+    conn = db()
+    users = conn.execute("SELECT * FROM users WHERE active_car IS NOT NULL").fetchall()
+    conn.close()
+    for u in users:
+        if u["garage_type"]:
+            data = GARAGES.get(u["garage_type"])
+            if not data:
+                continue
+            # One independent Bernoulli trial for each elapsed UTC calendar day.
+            last = u["garage_last_check_at"] or u["garage_purchased_at"] or u["created_at"]
+            last_dt = parse_time(last) or now
+            days = max(0, (now.date() - last_dt.date()).days)
+            if days > 0:
+                stolen = False
+                for _ in range(days):
+                    if random.random() < data["risk"]:
+                        stolen = True
+                        break
+                conn = db()
+                conn.execute("UPDATE users SET garage_last_check_at=? WHERE user_id=?",
+                             (now.isoformat(), u["user_id"]))
+                if stolen:
+                    stolen_car = u["active_car"]
+                    conn.execute("""UPDATE inventory_items SET quantity=quantity-1
+                                    WHERE user_id=? AND item_type='car' AND item_key=? AND quantity>0""",
+                                 (u["user_id"], stolen_car))
+                    conn.execute("""DELETE FROM inventory_items
+                                    WHERE user_id=? AND item_type='car' AND item_key=? AND quantity<=0""",
+                                 (u["user_id"], stolen_car))
+                    replacement = conn.execute("""SELECT item_key FROM inventory_items
+                                                  WHERE user_id=? AND item_type='car' AND quantity>0
+                                                  ORDER BY item_key LIMIT 1""",(u["user_id"],)).fetchone()
+                    conn.execute("UPDATE users SET active_car=? WHERE user_id=?",
+                                 (replacement["item_key"] if replacement else None, u["user_id"]))
+                    conn.execute("INSERT INTO garage_events(user_id,event_type,event_at,details) VALUES(?,?,?,?)",
+                                 (u["user_id"], "stolen", now.isoformat(), f"Викрадено: {stolen_car}; гараж: {u['garage_type']}"))
+                conn.commit(); conn.close()
+                if stolen:
+                    await safe_dm(u["user_id"], embed_obj=embed(
+                        "🚨 Викрадення автомобіля!",
+                        "🚨 **Спрацював датчик руху в вашому гаражі!**\n\n"
+                        "Вашу машину було викрадено!\n"
+                        "Автомобіль видалено з інвентарю та профілю.",
+                        discord.Color.red()
+                    ))
+                    continue
+        else:
+            # First prompt for cars acquired before/after this update.
+            if not u["garage_offer_sent_at"]:
+                await send_garage_offer(u["user_id"])
+            elif u["garage_reminder_at"] and parse_time(u["garage_reminder_at"]) and parse_time(u["garage_reminder_at"]) <= now:
+                deadline = parse_time(u["garage_offer_deadline"])
+                if not deadline or now < deadline:
+                    await garage_reminder(u["user_id"])
+                conn = db()
+                conn.execute("UPDATE users SET garage_reminder_at=NULL WHERE user_id=?", (u["user_id"],))
+                conn.commit(); conn.close()
+
+async def pay_businesses():
+    now = datetime.now(timezone.utc)
+    conn = db()
+    rows = conn.execute("SELECT * FROM businesses ORDER BY business_id").fetchall()
+    conn.close()
+    for b in rows:
+        user = get_user(b["user_id"])
+        if user["active_business"] != b["business_name"]:
+            continue
+        last = parse_time(b["last_paid_at"]) or now
+        hours = int((now - last).total_seconds() // 3600)
+        if hours <= 0:
+            continue
+        amount = hours * b["hourly_profit"]
+        money_add(b["user_id"], amount)
+        new_last = last + timedelta(hours=hours)
+        conn = db()
+        conn.execute("UPDATE businesses SET last_paid_at=? WHERE business_id=?", (new_last.isoformat(), b["business_id"]))
+        conn.commit(); conn.close()
+        await safe_dm(b["user_id"], embed_obj=embed(
+            "🏢 Прибуток бізнесу",
+            f"Твій бізнес **{b['business_name']}** приніс тобі **{money(amount)} грн.** за **{hours} год.**\n\n"
+            f"💰 Тепер твій бюджет складає: **{money(get_user(b['user_id'])['balance'])} грн.**",
+            discord.Color.green()
+        ))
+
+async def economy_loop():
+    await asyncio.sleep(10)
+    while not bot.is_closed():
+        try:
+            await pay_businesses()
+            await process_garages()
+            await process_loans()
+        except Exception as exc:
+            print(f"[ECONOMY] loop error: {exc!r}")
+        await asyncio.sleep(GARAGE_CHECK_INTERVAL)
+
+class BusinessView(discord.ui.View):
+    def __init__(self, owner_id):
+        super().__init__(timeout=600)
+        self.owner_id = owner_id
+        options=[]
+        for name, price, hourly in BUSINESSES:
+            options.append(discord.SelectOption(
+                label=name[:100], description=f"{money(price)} 💰 • +{money(hourly)}/год.", value=name))
+        select=discord.ui.Select(placeholder="Обери бізнес для покупки", options=options)
+        select.callback=self.buy
+        self.add_item(select)
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("❌ Це меню належить іншому гравцю.", ephemeral=True)
+            return False
+        return True
+
+    async def buy(self, interaction):
+        name=self.children[0].values[0]
+        _, price, hourly=BUSINESS_BY_NAME[name]
+        u=get_user(interaction.user.id, interaction.user.name)
+        if u["balance"] < price:
+            return await interaction.response.send_message(
+                f"❌ Недостатньо грошей. Потрібно **{money(price)}** 💰.", ephemeral=True)
+        if find_inventory_item(interaction.user.id, "business", name):
+            return await interaction.response.send_message(
+                "❌ Такий бізнес уже є у твоєму інвентарі. Придбати дубль цього бізнесу не можна.",
+                ephemeral=True)
+        if not money_add(interaction.user.id, -price):
+            return await interaction.response.send_message("❌ Не вдалося списати гроші.", ephemeral=True)
+        now=datetime.now(timezone.utc).isoformat()
+        conn=db()
+        conn.execute("""INSERT INTO inventory_items(user_id,item_type,item_key,quantity)
+                        VALUES(?,?,?,1) ON CONFLICT(user_id,item_type,item_key)
+                        DO UPDATE SET quantity=quantity+1""",
+                     (interaction.user.id,"business",name))
+        # First business becomes active automatically. Further businesses are inventory only.
+        row=conn.execute("SELECT active_business FROM users WHERE user_id=?", (interaction.user.id,)).fetchone()
+        if not row["active_business"]:
+            conn.execute("UPDATE users SET active_business=? WHERE user_id=?", (name,interaction.user.id))
+        conn.execute("INSERT INTO businesses(user_id,business_name,price,hourly_profit,last_paid_at) VALUES(?,?,?,?,?)",
+                     (interaction.user.id,name,price,hourly,now))
+        conn.commit(); conn.close()
+        active = get_user(interaction.user.id)["active_business"]
+        msg = (f"🏢 Бізнес **{name}** придбано за **{money(price)}** 💰.\n\n"
+               f"💵 Прибуток: **{money(hourly)} грн./год.**\n")
+        if active == name:
+            msg += "🟢 Він автоматично став твоїм **активним бізнесом**."
+        else:
+            msg += "ℹ️ **Активний бізнес можна мати лише один.** Цей бізнес додано в `/inventory`; там його можна зробити активним замість поточного."
+        await interaction.response.send_message(embed=embed("🏢 Бізнес придбано",msg,discord.Color.green()), ephemeral=True)
+
+@bot.tree.command(name="business", description="Купити бізнес")
+async def business(interaction: discord.Interaction):
+    if not normal_channel_only(interaction): return await reject_wrong_channel(interaction)
+    lines=[f"{i}. **{n}** — {money(p)} 💰 • +{money(h)}/год. (~{money(h*24)}/день)" for i,(n,p,h) in enumerate(BUSINESSES,1)]
+    await interaction.response.send_message(
+        embed=embed("🏢 Бізнес-центр", "Обери бізнес, який хочеш придбати:\n\n"+"\n".join(lines)+
+                    "\n\n🟢 Активним одночасно може бути лише **один** бізнес. Інші зберігаються в `/inventory`.",discord.Color.gold()),
+        view=BusinessView(interaction.user.id), ephemeral=False)
+
+class BankMainView(discord.ui.View):
+    def __init__(self, owner_id):
+        super().__init__(timeout=600)
+        self.owner_id=owner_id
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("❌ Це банківське меню відкрив інший гравець.", ephemeral=True)
+            return False
+        return True
+    @discord.ui.button(label="Оформити кредит", emoji="💳", style=discord.ButtonStyle.success, row=0)
+    async def take_bank(self, interaction, button): await interaction.response.send_modal(BankLoanModal())
+    @discord.ui.button(label="Погасити кредит", emoji="💰", style=discord.ButtonStyle.primary, row=0)
+    async def repay(self, interaction, button): await show_repay_menu(interaction)
+    @discord.ui.button(label="Кредити", emoji="📋", style=discord.ButtonStyle.secondary, row=0)
+    async def credits(self, interaction, button): await show_loans(interaction)
+    @discord.ui.button(label="Взяти у кредит від гравця", emoji="🤝", style=discord.ButtonStyle.primary, row=1)
+    async def borrow_player(self, interaction, button): await interaction.response.send_modal(PlayerBorrowModal())
+    @discord.ui.button(label="Запропонувати в кредит гравцю", emoji="💼", style=discord.ButtonStyle.success, row=1)
+    async def lend_player(self, interaction, button): await interaction.response.send_modal(PlayerLendModal())
+
+class BankLoanModal(discord.ui.Modal, title="Оформлення кредиту"):
+    amount=discord.ui.TextInput(label="Введіть суму кредиту", placeholder="Наприклад: 10000", min_length=4, max_length=12)
+    days=discord.ui.TextInput(label="Через скільки днів погасити кредит?", placeholder="Наприклад: 10", min_length=1, max_length=3)
+    async def on_submit(self, interaction):
+        if get_user(interaction.user.id)["bank_banned"]:
+            return await interaction.response.send_message("❌ Тобі більше недоступне кредитування банку.", ephemeral=True)
+        try: amount=int(str(self.amount.value).replace(" ","")); assert BANK_MIN<=amount<=BANK_MAX
+        except (ValueError,AssertionError): return await interaction.response.send_message("❌ Сума має бути від 1 000 до 100 000 000 грн.", ephemeral=True)
+        days=parse_days(self.days.value,1,365)
+        if days is None: return await interaction.response.send_message("❌ Кількість днів: від 1 до 365.", ephemeral=True)
+        rate=bank_rate(amount); total=loan_total(amount,rate)
+        await interaction.response.send_message(
+            embed=embed("💳 Підтвердження кредиту",
+                f"Ти впевнений, що береш кредит **{money(amount)} грн.** на **{days} дн.**?\n\n"
+                f"📈 Відсоток: **{rate:.4f}%**\n"
+                f"💰 До погашення: **{money(total)} грн.**\n"
+                f"📅 Дата погашення: <t:{int((datetime.now(timezone.utc)+timedelta(days=days)).timestamp())}:F>",
+                discord.Color.gold()), view=BankConfirmView(interaction.user.id,amount,rate,days), ephemeral=True)
+
+class BankConfirmView(discord.ui.View):
+    def __init__(self,user_id,amount,rate,days):
+        super().__init__(timeout=300); self.user_id=user_id; self.amount=amount; self.rate=rate; self.days=days; self.done=False
+    async def interaction_check(self,interaction):
+        if interaction.user.id!=self.user_id:
+            await interaction.response.send_message("❌ Це підтвердження належить іншому гравцю.",ephemeral=True); return False
+        return True
+    @discord.ui.button(label="Підтвердити",emoji="✅",style=discord.ButtonStyle.success)
+    async def yes(self,interaction,button):
+        if self.done: return
+        self.done=True
+        if get_user(self.user_id)["bank_banned"]:
+            return await interaction.response.send_message("❌ Банк більше не кредитує тебе.",ephemeral=True)
+        due=datetime.now(timezone.utc)+timedelta(days=self.days)
+        total=loan_total(self.amount,self.rate)
+        conn=db()
+        # Only one active bank/player loan at a time per borrower.
+        exists=conn.execute("SELECT 1 FROM loans WHERE borrower_id=? AND status IN ('active','grace')",(self.user_id,)).fetchone()
+        if exists:
+            conn.close(); return await interaction.response.send_message("❌ У тебе вже є непогашений кредит.",ephemeral=True)
+        conn.execute("""INSERT INTO loans(lender_id,borrower_id,principal,rate,total_due,created_at,due_at,status)
+                        VALUES(0,?,?,?,?,?,?, 'active')""",
+                     (self.user_id,self.amount,self.rate,total,datetime.now(timezone.utc).isoformat(),due.isoformat()))
+        conn.commit(); conn.close()
+        money_add(self.user_id,self.amount)
+        await interaction.response.edit_message(embed=embed("💳 Кредит оформлено",
+            f"Банк зарахував **{money(self.amount)} грн.** на твій баланс.\n\n"
+            f"До погашення: **{money(total)} грн.** ({self.rate:.4f}%).\n"
+            f"Термін: **{self.days} дн.**",discord.Color.green()),view=None)
+    @discord.ui.button(label="Відмовитись",emoji="❌",style=discord.ButtonStyle.danger)
+    async def no(self,interaction,button):
+        self.done=True
+        await interaction.response.edit_message(content="❌ Кредит скасовано.",embed=None,view=None)
+
+async def show_loans(interaction):
+    conn=db()
+    rows=conn.execute("SELECT * FROM loans WHERE status IN ('active','grace') ORDER BY due_at ASC").fetchall()
+    conn.close()
+    if not rows: text="Наразі активних кредитів немає."
+    else:
+        lines=[]
+        for r in rows:
+            lender="🏦 Банк" if r["lender_id"]==0 else f"<@{r['lender_id']}>"
+            lines.append(f"• <@{r['borrower_id']}> ← {lender} — **{money(r['principal'])} грн.** • **{r['rate']:.4f}%** • до <t:{int(datetime.fromisoformat(r['due_at']).timestamp())}:R>")
+        text="\n".join(lines)
+    await interaction.response.send_message(embed=embed("📋 Активні кредити",text,discord.Color.blurple()),ephemeral=False)
+
+async def show_repay_menu(interaction):
+    conn=db()
+    rows=conn.execute("SELECT * FROM loans WHERE borrower_id=? AND status IN ('active','grace') ORDER BY due_at",(interaction.user.id,)).fetchall()
+    conn.close()
+    if not rows: return await interaction.response.send_message("❌ У тебе немає активних кредитів.",ephemeral=True)
+    options=[discord.SelectOption(label=f"{money(r['total_due'])} грн. — {('банк' if r['lender_id']==0 else 'гравець')}",value=str(r["loan_id"])) for r in rows[:25]]
+    v=RepaySelectView(interaction.user.id,options)
+    await interaction.response.send_message(embed=embed("💰 Погашення кредиту","Обери кредит, який хочеш погасити.",discord.Color.gold()),view=v,ephemeral=True)
+
+class RepaySelectView(discord.ui.View):
+    def __init__(self,owner_id,options):
+        super().__init__(timeout=300); self.owner_id=owner_id
+        select=discord.ui.Select(placeholder="Обери кредит",options=options); select.callback=self.select; self.add_item(select)
+    async def interaction_check(self,interaction):
+        if interaction.user.id!=self.owner_id:
+            await interaction.response.send_message("❌ Це меню не для тебе.",ephemeral=True); return False
+        return True
+    async def select(self,interaction):
+        loan_id=int(self.children[0].values[0])
+        conn=db(); loan=conn.execute("SELECT * FROM loans WHERE loan_id=? AND borrower_id=? AND status IN ('active','grace')",(loan_id,self.owner_id)).fetchone(); conn.close()
+        if not loan: return await interaction.response.send_message("❌ Кредит уже закрито.",ephemeral=True)
+        await interaction.response.send_message(embed=embed("💰 Підтвердження погашення",
+            f"Точно погасити кредит на **{money(loan['total_due'])} грн.**?\n"
+            f"📈 Відсоток: **{loan['rate']:.4f}%**",discord.Color.gold()),view=RepayConfirmView(self.owner_id,loan_id),ephemeral=True)
+
+class RepayConfirmView(discord.ui.View):
+    def __init__(self,owner_id,loan_id):
+        super().__init__(timeout=300); self.owner_id=owner_id; self.loan_id=loan_id
+    async def interaction_check(self,interaction):
+        if interaction.user.id!=self.owner_id:
+            await interaction.response.send_message("❌ Це меню не для тебе.",ephemeral=True); return False
+        return True
+    @discord.ui.button(label="Погасити",emoji="💚",style=discord.ButtonStyle.success)
+    async def repay(self,interaction,button):
+        conn=db()
+        loan=conn.execute("SELECT * FROM loans WHERE loan_id=? AND borrower_id=? AND status IN ('active','grace')",(self.loan_id,self.owner_id)).fetchone()
+        if not loan:
+            conn.close(); return await interaction.response.send_message("❌ Кредит уже закрито.",ephemeral=True)
+        u=conn.execute("SELECT balance FROM users WHERE user_id=?",(self.owner_id,)).fetchone()
+        if not u or u["balance"]<loan["total_due"]:
+            conn.close(); return await interaction.response.send_message(f"❌ Недостатньо коштів. Потрібно **{money(loan['total_due'])} грн.**",ephemeral=True)
+        conn.execute("UPDATE users SET balance=balance-? WHERE user_id=?",(loan["total_due"],self.owner_id))
+        if loan["lender_id"] != 0:
+            conn.execute("UPDATE users SET balance=balance+? WHERE user_id=?",(loan["total_due"],loan["lender_id"]))
+        conn.execute("UPDATE loans SET status='paid',closed_at=? WHERE loan_id=?",(datetime.now(timezone.utc).isoformat(),self.loan_id))
+        conn.commit(); conn.close()
+        await interaction.response.edit_message(embed=embed("✅ Кредит погашено","Дякуємо за співпрацю! Кредит успішно погашено.",discord.Color.green()),view=None)
+    @discord.ui.button(label="Відмовитись",emoji="❌",style=discord.ButtonStyle.danger)
+    async def cancel(self,interaction,button):
+        await interaction.response.edit_message(content="❌ Погашення скасовано.",embed=None,view=None)
+
+async def process_loans():
+    now=datetime.now(timezone.utc)
+    conn=db()
+    due=conn.execute("SELECT * FROM loans WHERE status='active' AND due_at<=?",(now.isoformat(),)).fetchall()
+    for loan in due:
+        grace=now+timedelta(hours=24)
+        conn.execute("UPDATE loans SET status='grace',grace_until=?,due_notice_sent_at=? WHERE loan_id=?",
+                     (grace.isoformat(),now.isoformat(),loan["loan_id"]))
+        # Notice is sent after commit below.
+    conn.commit(); conn.close()
+    for loan in due:
+        await safe_dm(loan["borrower_id"],embed_obj=embed(
+            "⏰ Час погашення кредиту настав!",
+            f"У тебе є **24 год.** щоб погасити кредит на суму **{money(loan['total_due'])} грн.**\n\n"
+            "Натисни **«Погасити»** у цьому повідомленні або скористайся `/bank` → «Погасити кредит».",
+            discord.Color.orange()),view=LoanDueView(loan["borrower_id"],loan["loan_id"]))
+    conn=db()
+    reminders=conn.execute("SELECT * FROM loans WHERE status='grace' AND reminder_at IS NOT NULL AND reminder_at<=?",(now.isoformat(),)).fetchall()
+    conn.execute("UPDATE loans SET reminder_at=NULL WHERE status='grace' AND reminder_at IS NOT NULL AND reminder_at<=?", (now.isoformat(),))
+    expired=conn.execute("SELECT * FROM loans WHERE status='grace' AND grace_until<=?",(now.isoformat(),)).fetchall()
+    for loan in expired:
+        u=conn.execute("SELECT balance FROM users WHERE user_id=?",(loan["borrower_id"],)).fetchone()
+        bal = u["balance"] if u else 0
+        if bal >= loan["total_due"]:
+            conn.execute("UPDATE users SET balance=balance-? WHERE user_id=?",(loan["total_due"],loan["borrower_id"]))
+            if loan["lender_id"] != 0:
+                conn.execute("UPDATE users SET balance=balance+? WHERE user_id=?",(loan["total_due"],loan["lender_id"]))
+            reason="Сума боргу автоматично списана з твого балансу."
+            status="paid"
+        else:
+            # For a bank loan the bank takes the remaining available balance and
+            # permanently blocks future bank credit. Player loans are only
+            # reported to the lender when funds are insufficient.
+            if loan["lender_id"] == 0:
+                if bal > 0:
+                    conn.execute("UPDATE users SET balance=0 WHERE user_id=?",(loan["borrower_id"],))
+                conn.execute("UPDATE users SET bank_banned=1 WHERE user_id=?",(loan["borrower_id"],))
+                reason="На балансі не вистачило коштів. Доступ до банківського кредитування заблоковано."
+            else:
+                if bal > 0:
+                    conn.execute("UPDATE users SET balance=0 WHERE user_id=?",(loan["borrower_id"],))
+                    conn.execute("UPDATE users SET balance=balance+? WHERE user_id=?",(bal,loan["lender_id"]))
+                reason="На балансі не вистачило коштів для повного погашення. Кредитор отримав доступну суму."
+            status="defaulted"
+        conn.execute("UPDATE loans SET status=?,closed_at=? WHERE loan_id=?",(status,now.isoformat(),loan["loan_id"]))
+        if loan["lender_id"] != 0:
+            asyncio.create_task(safe_dm(loan["lender_id"],embed_obj=embed(
+                "⚠️ Кредит прострочено",
+                f"<@{loan['borrower_id']}> не погасив кредит **{money(loan['total_due'])} грн.** у встановлений строк.",
+                discord.Color.red())))
+        asyncio.create_task(safe_dm(loan["borrower_id"],embed_obj=embed(
+            "⚠️ До вас прийшли кредитори" if loan["lender_id"] != 0 else "⚠️ Кредит прострочено",
+            f"Термін погашення кредиту минув.\n\n{reason}" +
+            ("\n\nБанк більше не надаватиме тобі нові кредити." if loan["lender_id"] == 0 else ""),
+            discord.Color.red())))
+    conn.commit(); conn.close()
+
+    for loan in reminders:
+        await safe_dm(loan["borrower_id"],embed_obj=embed(
+            "⏰ Нагадування про кредит",
+            f"Нагадую: тобі потрібно погасити кредит на **{money(loan['total_due'])} грн.**.\n"
+            "У тебе ще є час до завершення 24-годинного пільгового періоду.",
+            discord.Color.orange()),
+            view=LoanDueView(loan["borrower_id"],loan["loan_id"]))
+
+class LoanDueView(discord.ui.View):
+    def __init__(self,owner_id,loan_id):
+        super().__init__(timeout=24*60*60); self.owner_id=owner_id; self.loan_id=loan_id
+    async def interaction_check(self,interaction):
+        if interaction.user.id!=self.owner_id:
+            await interaction.response.send_message("❌ Це повідомлення призначене іншому гравцю.",ephemeral=True); return False
+        return True
+    @discord.ui.button(label="Погасити",emoji="💚",style=discord.ButtonStyle.success)
+    async def repay(self,interaction,button):
+        conn=db(); loan=conn.execute("SELECT * FROM loans WHERE loan_id=? AND borrower_id=? AND status='grace'",(self.loan_id,self.owner_id)).fetchone()
+        if not loan: conn.close(); return await interaction.response.send_message("❌ Кредит уже закрито.",ephemeral=True)
+        bal=conn.execute("SELECT balance FROM users WHERE user_id=?",(self.owner_id,)).fetchone()["balance"]
+        if bal<loan["total_due"]:
+            conn.close(); return await interaction.response.send_message(f"❌ Недостатньо коштів. Потрібно {money(loan['total_due'])} грн.",ephemeral=True)
+        conn.execute("UPDATE users SET balance=balance-? WHERE user_id=?",(loan["total_due"],self.owner_id))
+        if loan["lender_id"] != 0:
+            conn.execute("UPDATE users SET balance=balance+? WHERE user_id=?",(loan["total_due"],loan["lender_id"]))
+        conn.execute("UPDATE loans SET status='paid',closed_at=? WHERE loan_id=?",(datetime.now(timezone.utc).isoformat(),self.loan_id))
+        conn.commit(); conn.close()
+        await interaction.response.edit_message(embed=embed("🤝 Дякуємо за співпрацю","Кредит успішно погашено.",discord.Color.green()),view=None)
+    @discord.ui.button(label="Нагадати через 1 год.",emoji="⏰",style=discord.ButtonStyle.danger)
+    async def remind(self,interaction,button):
+        conn=db()
+        loan=conn.execute("SELECT * FROM loans WHERE loan_id=? AND borrower_id=? AND status='grace'",
+                          (self.loan_id,self.owner_id)).fetchone()
+        if not loan:
+            conn.close()
+            return await interaction.response.send_message("❌ Кредит уже закрито.",ephemeral=True)
+        reminder=datetime.now(timezone.utc)+timedelta(hours=1)
+        conn.execute("UPDATE loans SET reminder_at=? WHERE loan_id=?",(reminder.isoformat(),self.loan_id))
+        conn.commit(); conn.close()
+        await interaction.response.edit_message(
+            content="⏰ Нагадування встановлено. Я напишу тобі через **1 годину**.",
+            view=None)
+
+def valid_player_loan(principal, rate, days):
+    return 1_000 <= principal <= MAX_BET and 0.1 <= rate <= 70 and 1 <= days <= 365
+
+class PlayerLoanModal(discord.ui.Modal):
+    def __init__(self, title, target_label):
+        super().__init__(title=title)
+        self.target=discord.ui.TextInput(label=target_label,placeholder="Discord ID або @нік")
+        self.amount=discord.ui.TextInput(label="Сума",placeholder="Наприклад: 10000")
+        self.rate=discord.ui.TextInput(label="Відсоток",placeholder="Наприклад: 10")
+        self.days=discord.ui.TextInput(label="Кількість днів",placeholder="Наприклад: 10")
+        for x in (self.target,self.amount,self.rate,self.days): self.add_item(x)
+    async def parse(self,interaction):
+        target=await resolve_member(interaction.guild,str(self.target.value).strip())
+        if not target or target.bot or target.id==interaction.user.id:
+            await interaction.response.send_message("❌ Не вдалося знайти потрібного гравця.",ephemeral=True); return None
+        try: amount=int(str(self.amount.value).replace(" ","")); rate=float(str(self.rate.value).replace(",",".")); days=int(self.days.value)
+        except ValueError:
+            await interaction.response.send_message("❌ Перевір суму, відсоток та кількість днів.",ephemeral=True); return None
+        if not valid_player_loan(amount,rate,days):
+            await interaction.response.send_message("❌ Сума: 1 000+; відсоток: 0.1–70%; термін: 1–365 днів.",ephemeral=True); return None
+        return target,amount,rate,days
+
+class PlayerBorrowModal(PlayerLoanModal):
+    def __init__(self):
+        super().__init__("Взяти у кредит від гравця","У кого взяти кредит?")
+
+    async def on_submit(self,interaction):
+        parsed=await self.parse(interaction)
+        if not parsed:return
+        lender,amount,rate,days=parsed
+        await create_player_offer(interaction.user.id,lender.id,lender.id,interaction.user.id,amount,rate,days)
+
+class PlayerLendModal(PlayerLoanModal):
+    def __init__(self):
+        super().__init__("Запропонувати кредит гравцю","Кому запропонувати кредит?")
+
+    async def on_submit(self,interaction):
+        parsed=await self.parse(interaction)
+        if not parsed:return
+        borrower,amount,rate,days=parsed
+        if get_user(interaction.user.id)["balance"]<amount:
+            return await interaction.response.send_message("❌ У тебе недостатньо коштів для такої пропозиції.",ephemeral=True)
+        await create_player_offer(interaction.user.id,borrower.id,interaction.user.id,borrower.id,amount,rate,days)
+
+async def create_player_offer(proposer_id,counterparty_id,lender_id,borrower_id,amount,rate,days):
+    conn=db()
+    cur=conn.execute("""INSERT INTO loan_offers(proposer_id,counterparty_id,lender_id,borrower_id,principal,rate,days)
+                        VALUES(?,?,?,?,?,?,?)""",(proposer_id,counterparty_id,lender_id,borrower_id,amount,rate,days))
+    offer_id=cur.lastrowid
+    conn.commit();conn.close()
+    role_text=f"<@{lender_id}> → <@{borrower_id}>"
+    view=PlayerOfferView(offer_id,counterparty_id)
+    ok=await safe_dm(counterparty_id,embed_obj=embed("🤝 Пропозиція кредиту",
+        f"💰 Сума: **{money(amount)} грн.**\n📈 Відсоток: **{rate:.2f}%**\n📅 Термін: **{days} дн.**\n"
+        f"💵 До погашення: **{money(loan_total(amount,rate))} грн.**\n\n"
+        f"Учасники: {role_text}\n\nОбери: схвалити, відмовити або запропонувати свої умови.",discord.Color.gold()),view=view)
+    if not ok:
+        conn=db();conn.execute("UPDATE loan_offers SET status='failed' WHERE offer_id=?",(offer_id,));conn.commit();conn.close()
+    return offer_id
+
+class PlayerOfferView(discord.ui.View):
+    def __init__(self,offer_id,owner_id):
+        super().__init__(timeout=3600);self.offer_id=offer_id;self.owner_id=owner_id
+    async def interaction_check(self,interaction):
+        if interaction.user.id!=self.owner_id:
+            await interaction.response.send_message("❌ Ця пропозиція призначена іншому гравцю.",ephemeral=True);return False
+        return True
+    @discord.ui.button(label="Схвалити",emoji="✅",style=discord.ButtonStyle.success)
+    async def accept(self,interaction,button):
+        conn=db();offer=conn.execute("SELECT * FROM loan_offers WHERE offer_id=? AND status='pending'",(self.offer_id,)).fetchone()
+        if not offer:conn.close();return await interaction.response.send_message("❌ Пропозиція вже недійсна.",ephemeral=True)
+        lender=conn.execute("SELECT balance FROM users WHERE user_id=?",(offer["lender_id"],)).fetchone()
+        if not lender or lender["balance"]<offer["principal"]:
+            conn.close();return await interaction.response.send_message("❌ У кредитора зараз недостатньо коштів.",ephemeral=True)
+        # Borrower can have only one active loan.
+        active=conn.execute("SELECT 1 FROM loans WHERE borrower_id=? AND status IN ('active','grace')",(offer["borrower_id"],)).fetchone()
+        if active:
+            conn.close();return await interaction.response.send_message("❌ Позичальник уже має непогашений кредит.",ephemeral=True)
+        now=datetime.now(timezone.utc);due=now+timedelta(days=offer["days"])
+        total=loan_total(offer["principal"],offer["rate"])
+        conn.execute("UPDATE users SET balance=balance-? WHERE user_id=?",(offer["principal"],offer["lender_id"]))
+        conn.execute("UPDATE users SET balance=balance+? WHERE user_id=?",(offer["principal"],offer["borrower_id"]))
+        conn.execute("""INSERT INTO loans(lender_id,borrower_id,principal,rate,total_due,created_at,due_at,status)
+                        VALUES(?,?,?,?,?,?,?,'active')""",
+                     (offer["lender_id"],offer["borrower_id"],offer["principal"],offer["rate"],total,now.isoformat(),due.isoformat()))
+        conn.execute("UPDATE loan_offers SET status='accepted',updated_at=? WHERE offer_id=?",(now.isoformat(),self.offer_id))
+        conn.commit();conn.close()
+        await interaction.response.edit_message(embed=embed("🤝 Кредит схвалено",
+            f"Кредит на **{money(offer['principal'])} грн.** оформлено.\n"
+            f"До погашення: **{money(total)} грн.**",discord.Color.green()),view=None)
+        await safe_dm(offer["lender_id"],embed_obj=embed("💰 Кредит видано",
+            f"<@{offer['borrower_id']}> отримав від тебе **{money(offer['principal'])} грн.**.\n"
+            f"До повернення: **{money(total)} грн.**",discord.Color.green()))
+    @discord.ui.button(label="Відмовити",emoji="❌",style=discord.ButtonStyle.danger)
+    async def decline(self,interaction,button):
+        conn=db();conn.execute("UPDATE loan_offers SET status='declined',updated_at=? WHERE offer_id=? AND status='pending'",
+                               (datetime.now(timezone.utc).isoformat(),self.offer_id));conn.commit();conn.close()
+        await interaction.response.edit_message(embed=embed("❌ Пропозицію відхилено","Кредитна пропозиція була відхилена.",discord.Color.red()),view=None)
+    @discord.ui.button(label="Запропонувати свої умови",emoji="✏️",style=discord.ButtonStyle.primary)
+    async def counter(self,interaction,button):
+        await interaction.response.send_modal(CounterLoanModal(self.offer_id,self.owner_id))
+
+class CounterLoanModal(discord.ui.Modal,title="Нові умови кредиту"):
+    amount=discord.ui.TextInput(label="Нова сума",placeholder="Наприклад: 20000")
+    rate=discord.ui.TextInput(label="Новий відсоток",placeholder="Наприклад: 15")
+    days=discord.ui.TextInput(label="Новий термін у днях",placeholder="Наприклад: 14")
+    def __init__(self,offer_id,owner_id):
+        super().__init__();self.offer_id=offer_id;self.owner_id=owner_id
+    async def on_submit(self,interaction):
+        try:amount=int(self.amount.value.replace(" ",""));rate=float(self.rate.value.replace(",","."));days=int(self.days.value)
+        except ValueError:return await interaction.response.send_message("❌ Невірні умови.",ephemeral=True)
+        if not valid_player_loan(amount,rate,days):return await interaction.response.send_message("❌ Сума від 1 000, відсоток 0.1–70%, термін 1–365 днів.",ephemeral=True)
+        conn=db();offer=conn.execute("SELECT * FROM loan_offers WHERE offer_id=? AND status='pending'",(self.offer_id,)).fetchone()
+        if not offer:conn.close();return await interaction.response.send_message("❌ Пропозиція вже недійсна.",ephemeral=True)
+        # Counteroffer keeps the same lender/borrower roles and goes back to original proposer.
+        conn.execute("""UPDATE loan_offers SET principal=?,rate=?,days=?,counterparty_id=?,updated_at=? WHERE offer_id=?""",
+                     (amount,rate,days,offer["proposer_id"],datetime.now(timezone.utc).isoformat(),self.offer_id))
+        conn.commit();conn.close()
+        await interaction.response.edit_message(embed=embed("✏️ Нові умови надіслано","Твої умови відправлено іншій стороні кредиту.",discord.Color.blurple()),view=None)
+        await safe_dm(offer["proposer_id"],embed_obj=embed("✏️ Контрпропозиція",
+            f"Гравець <@{self.owner_id}> запропонував нові умови:\n\n"
+            f"💰 **{money(amount)} грн.**\n📈 **{rate:.2f}%**\n📅 **{days} дн.**\n"
+            f"💵 До погашення: **{money(loan_total(amount,rate))} грн.**",discord.Color.gold()),
+            view=PlayerOfferView(self.offer_id,offer["proposer_id"]))
+
+@bot.tree.command(name="bank", description="Відкрити банк та керувати кредитами")
+async def bank(interaction: discord.Interaction):
+    if not normal_channel_only(interaction): return await reject_wrong_channel(interaction)
+    if get_user(interaction.user.id, interaction.user.name)["bank_banned"]:
+        return await interaction.response.send_message(
+            "❌ **Банк більше недоступний для тебе.** Тобі закрито можливість брати кредити через порушення строків погашення та несплату попереднього боргу.",
+            ephemeral=True)
+    await interaction.response.send_message(embed=embed(
+        "🏦 Вітаємо у банку!",
+        "Тут ти можеш оформити кредит, погасити вже взятий борг або домовитися про кредит з іншим гравцем.\n\n"
+        "💳 **Оформити кредит** — отримати кошти від банку.\n"
+        "💰 **Погасити кредит** — достроково закрити борг.\n"
+        "📋 **Кредити** — переглянути активні кредити.\n"
+        "🤝 **Кредит від гравця** — подати заявку іншому гравцю.\n"
+        "💼 **Запропонувати кредит** — виступити кредитором.",
+        discord.Color.gold()),view=BankMainView(interaction.user.id))
 
 # ---------------- ADMIN ----------------
 
@@ -2929,6 +3754,12 @@ def build_database_report():
         market_rows = conn.execute(
             "SELECT listing_id, seller_id, item_type, item_key, price, status FROM market_listings ORDER BY listing_id DESC LIMIT 100"
         ).fetchall()
+        business_rows = conn.execute(
+            "SELECT user_id, business_name, price, hourly_profit, purchased_at, last_paid_at FROM businesses ORDER BY user_id, business_name"
+        ).fetchall()
+        loan_rows = conn.execute(
+            "SELECT loan_id, lender_id, borrower_id, principal, rate, total_due, due_at, status FROM loans ORDER BY loan_id DESC LIMIT 100"
+        ).fetchall()
     finally:
         conn.close()
 
@@ -2989,6 +3820,19 @@ def build_database_report():
         for x in market_rows
     ]
     parts.append(("🏪 Ринок", "\n".join(market_text) or "Немає оголошень."))
+
+    business_text = [
+        f"<@{x['user_id']}> | **{x['business_name']}** | +{money(x['hourly_profit'])}/год. | купівля `{money(x['price'])}`"
+        for x in business_rows
+    ]
+    parts.append(("🏢 Бізнеси", "\n".join(business_text) or "Немає бізнесів."))
+
+    loan_text = [
+        f"#{x['loan_id']} | <@{x['borrower_id']}> ← {'🏦 Банк' if x['lender_id']==0 else '<@'+str(x['lender_id'])+'>'} | "
+        f"`{money(x['principal'])}` → `{money(x['total_due'])}` | `{x['rate']:.4f}%` | `{x['status']}`"
+        for x in loan_rows
+    ]
+    parts.append(("💳 Кредити", "\n".join(loan_text) or "Немає кредитів."))
 
     return parts
 
@@ -3163,11 +4007,15 @@ async def promo_create(interaction: discord.Interaction, code: str, money_amount
 
 # ---------------- START ----------------
 
+_economy_task: Optional[asyncio.Task] = None
+
 @bot.event
 async def on_ready():
-    global _backup_task
+    global _backup_task, _economy_task
     init_db()
     await resume_masturbation_sessions()
+    if _economy_task is None or _economy_task.done():
+        _economy_task = asyncio.create_task(economy_loop())
     if _backup_task is None or _backup_task.done():
         _backup_task = asyncio.create_task(backup_loop())
     try:

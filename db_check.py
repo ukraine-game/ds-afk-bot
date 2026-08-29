@@ -15,7 +15,8 @@ print(f"Size: {path.stat().st_size:,} bytes")
 con = sqlite3.connect(path)
 print("Integrity:", con.execute("PRAGMA integrity_check").fetchone()[0])
 print("Journal mode:", con.execute("PRAGMA journal_mode").fetchone()[0])
-for table in ("users", "promos", "promo_uses", "roles", "bot_settings", "role_inventory", "cookie_games"):
+for table in ("users", "promos", "promo_uses", "roles", "bot_settings", "role_inventory",
+ "cookie_games", "inventory_items", "businesses", "garage_events", "loans", "loan_offers"):
     try:
         n = con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         print(f"{table}: {n}")
