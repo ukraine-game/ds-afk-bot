@@ -20,6 +20,9 @@ DAILY_REWARD = 50_000
 ROLE_CREATE_COST = 200_000
 ROLE_ADMIN_ID = 1542839885055004672
 OWNER_ID = 1455564327351226380
+PURCHASE_LOG_CHANNEL_ID = 1543243790943391764
+SYSTEM_LOG_CHANNEL_ID = 1543244165805117600
+MAX_LOAN_DAYS = 10
 
 # Discord CDN emoji links used by the server's embeds.
 EMOJI_DICK = "https://discord.com/assets/d59af318cacdcf3b.svg"
@@ -276,6 +279,7 @@ def _migrate_schema(conn):
             "garage_reminder_at": "TEXT",
             "garage_last_check_at": "TEXT",
             "bank_banned": "INTEGER NOT NULL DEFAULT 0",
+            "bank_ban_reason": "TEXT",
         },
         "promos": {"created_at": "TEXT NOT NULL DEFAULT ''"},
         "promo_uses": {"used_at": "TEXT NOT NULL DEFAULT ''"},
@@ -653,7 +657,14 @@ def money_add(user_id: int, amount: int):
         else:
             cur = conn.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (amount, user_id))
         ok = cur.rowcount == 1
+        new_balance = conn.execute("SELECT balance FROM users WHERE user_id=?", (user_id,)).fetchone()[0]
         conn.commit()
+        if ok:
+            # Systematic economy log: every balance mutation is recorded.
+            asyncio.get_event_loop().create_task(log_system(
+                f"💰 Гравець <@{user_id}>: зміна бюджету **{amount:+,} грн.**. "
+                f"Бюджет після: **{money(new_balance)} грн.**"
+            ))
         return ok
     finally:
         conn.close()
@@ -850,10 +861,10 @@ async def profile(interaction: discord.Interaction, user: discord.Member | None 
     e.set_thumbnail(url=target.display_avatar.url)
     e.add_field(name="🍆 Розмір", value=f"**{u['dick_size']} см**", inline=True)
     e.add_field(name="💰 Баланс", value=f"**{money(u['balance'])}**", inline=True)
-    e.add_field(name="🚗 Автомобіль", value=f"**{u['active_car'] or 'немає'}**", inline=False)
-    e.add_field(name="🏠 Дім", value=f"**{u['primary_house'] or 'немає'}**", inline=False)
-    e.add_field(name="🏢 Бізнес", value=f"**{u['active_business'] or 'немає'}**", inline=False)
-    e.add_field(name="🚘 Гараж", value=f"**{u['garage_type'] or 'немає'}**", inline=False)
+    e.add_field(name="🚗 Автомобіль", value=f"**{u['active_car'] or 'немає'}**", inline=True)
+    e.add_field(name="🏢 Бізнес", value=f"**{u['active_business'] or 'немає'}**", inline=True)
+    e.add_field(name="🏠 Дім", value=f"**{u['primary_house'] or 'немає'}**", inline=True)
+    e.add_field(name="🚘 Гараж", value=f"**{u['garage_type'] or 'немає'}**", inline=True)
     await interaction.response.send_message(embed=e)
 
 
@@ -988,10 +999,11 @@ async def promo(interaction: discord.Interaction):
 # ---------------- COINFLIP ----------------
 
 class CoinChoiceView(discord.ui.View):
-    def __init__(self, owner_id: int, bet: int):
+    def __init__(self, owner_id: int, bet: int, balance_before: int):
         super().__init__(timeout=60)
         self.owner_id = owner_id
         self.bet = bet
+        self.balance_before = balance_before
         self.choice = None
         self.processing = False
 
@@ -1059,6 +1071,13 @@ class CoinChoiceView(discord.ui.View):
             await interaction.channel.send(
                 embed=embed(title, text, color)
             )
+            after_balance = get_user(self.owner_id)["balance"]
+            asyncio.create_task(log_system(
+                f"🪙 Гравець <@{self.owner_id}> поставив **{money(self.bet)} грн.** на **{self.choice}** в грі **Coinflip**. "
+                f"Випало: **{result}**. "
+                f"{'Виграш: +'+money(self.bet)+' грн.' if won else 'Забираю ставку: '+money(self.bet)+' грн.'} "
+                f"Бюджет до: **{money(self.balance_before)}** — Бюджет після: **{money(after_balance)}**."
+            ))
         except Exception as exc:
             # Do not leave the player stuck on the waiting message if something fails.
             print(f"Coinflip error: {exc!r}")
@@ -1082,7 +1101,7 @@ async def coinflip(interaction: discord.Interaction, bet: app_commands.Range[int
     money_add(interaction.user.id, -bet)
     await interaction.response.send_message(
         embed=embed("🪙 Coinflip", f"💰 Ставка: **{money(bet)}**\n\n🦅 **Орел** або 🪙 **Решка**?"),
-        view=CoinChoiceView(interaction.user.id, bet),
+        view=CoinChoiceView(interaction.user.id, bet, u["balance"]),
         ephemeral=True,
     )
 
@@ -2041,6 +2060,7 @@ class CaseQuantityView(discord.ui.View):
                     "❌ Не вдалося списати гроші. Спробуй ще раз.", ephemeral=True
                 )
 
+            asyncio.create_task(log_purchase(f"Гравець **{interaction.user}** (<@{interaction.user.id}>) купив **{quantity} шт.** кейсів **{self.rarity}** за **{money(total)} грн.**"))
             await interaction.response.send_message(
                 embed=embed(
                     "✅ Кейс успішно придбано",
@@ -2148,6 +2168,7 @@ class CarResultView(discord.ui.View):
             conn.execute("UPDATE users SET active_car=? WHERE user_id=?",(self.car_name,interaction.user.id))
         conn.commit(); conn.close()
         for item in self.children: item.disabled=True
+        asyncio.create_task(log_purchase(f"Гравець **{interaction.user}** (<@{interaction.user.id}>) забрав з кейса автомобіль **{self.car_name}** вартістю **{money(self.car_value)} грн.**"))
         await interaction.response.edit_message(
             embed=embed("🚗 Машину забрано", f"**{self.car_name}** додано до твого інвентарю.\n\nПеревір `/inventory` або профіль.", discord.Color.green()),
             view=self
@@ -2393,6 +2414,7 @@ class HouseShopView(discord.ui.View):
         if not row["primary_house"]:
             conn.execute("UPDATE users SET primary_house=? WHERE user_id=?",(name,interaction.user.id))
         conn.commit(); conn.close()
+        asyncio.create_task(log_purchase(f"Гравець **{interaction.user}** (<@{interaction.user.id}>) купив нерухомість **{name}** за **{money(price)} грн.**"))
         await interaction.response.send_message(embed=embed("🏠 Нерухомість придбано", f"Ти придбав **{name}** за **{money(price)}** 💰.\n\nОб'єкт збережено в `/inventory`.", discord.Color.green()), ephemeral=True)
 
 @bot.tree.command(name="houses", description="Купити квартиру, будинок або віллу у держави")
@@ -2866,7 +2888,7 @@ def bank_rate(amount: int) -> float:
 def loan_total(principal: int, rate: float) -> int:
     return int(round(principal * (1 + rate / 100)))
 
-def parse_days(value: str, minimum=1, maximum=365):
+def parse_days(value: str, minimum=1, maximum=MAX_LOAN_DAYS):
     try:
         n = int(str(value).strip())
         if not minimum <= n <= maximum:
@@ -2874,6 +2896,22 @@ def parse_days(value: str, minimum=1, maximum=365):
         return n
     except (TypeError, ValueError):
         return None
+
+async def send_log(channel_id: int, message: str, *, color=discord.Color.dark_grey()):
+    channel = bot.get_channel(channel_id)
+    if channel is None:
+        try: channel = await bot.fetch_channel(channel_id)
+        except discord.HTTPException: return
+    try:
+        await channel.send(embed=embed("📋 Лог", message, color))
+    except discord.HTTPException:
+        pass
+
+async def log_purchase(message: str):
+    await send_log(PURCHASE_LOG_CHANNEL_ID, message, color=discord.Color.green())
+
+async def log_system(message: str):
+    await send_log(SYSTEM_LOG_CHANNEL_ID, message, color=discord.Color.blurple())
 
 async def safe_dm(user_id: int, *, embed_obj=None, content=None, view=None):
     user = bot.get_user(user_id)
@@ -3005,6 +3043,7 @@ class GarageChoiceView(discord.ui.View):
                         garage_last_check_at=?, garage_offer_deadline=NULL, garage_reminder_at=NULL
                         WHERE user_id=?""", (garage_type, now, now, interaction.user.id))
         conn.commit(); conn.close()
+        asyncio.create_task(log_purchase(f"Гравець **{interaction.user}** (<@{interaction.user.id}>) купив гараж **{garage_type}** за **{money(data['price'])} грн.** для автомобіля **{u['active_car']}**."))
         for item in self.children: item.disabled = True
         await interaction.response.edit_message(
             embed=embed("🅿️ Гараж придбано",
@@ -3062,6 +3101,7 @@ async def process_garages():
                                  (u["user_id"], "stolen", now.isoformat(), f"Викрадено: {stolen_car}; гараж: {u['garage_type']}"))
                 conn.commit(); conn.close()
                 if stolen:
+                    asyncio.create_task(log_system(f"🚨 Гравець <@{u['user_id']}> втратив автомобіль **{stolen_car}**: спрацював датчик у гаражі **{u['garage_type']}**. Автомобіль видалено з інвентарю."))
                     await safe_dm(u["user_id"], embed_obj=embed(
                         "🚨 Викрадення автомобіля!",
                         "🚨 **Спрацював датчик руху в вашому гаражі!**\n\n"
@@ -3171,6 +3211,7 @@ class BusinessView(discord.ui.View):
         else:
             msg += "ℹ️ **Активний бізнес можна мати лише один.** Цей бізнес додано в `/inventory`; там його можна зробити активним замість поточного."
         await interaction.response.send_message(embed=embed("🏢 Бізнес придбано",msg,discord.Color.green()), ephemeral=True)
+        asyncio.create_task(log_purchase(f"Гравець **{interaction.user}** (<@{interaction.user.id}>) купив бізнес **{name}** за **{money(price)} грн.**. Прибуток: **+{money(hourly)} грн./год.**"))
 
 @bot.tree.command(name="business", description="Купити бізнес")
 async def business(interaction: discord.Interaction):
@@ -3209,8 +3250,8 @@ class BankLoanModal(discord.ui.Modal, title="Оформлення кредиту
             return await interaction.response.send_message("❌ Тобі більше недоступне кредитування банку.", ephemeral=True)
         try: amount=int(str(self.amount.value).replace(" ","")); assert BANK_MIN<=amount<=BANK_MAX
         except (ValueError,AssertionError): return await interaction.response.send_message("❌ Сума має бути від 1 000 до 100 000 000 грн.", ephemeral=True)
-        days=parse_days(self.days.value,1,365)
-        if days is None: return await interaction.response.send_message("❌ Кількість днів: від 1 до 365.", ephemeral=True)
+        days=parse_days(self.days.value,1,MAX_LOAN_DAYS)
+        if days is None: return await interaction.response.send_message("❌ Кількість днів: від 1 до 10.", ephemeral=True)
         rate=bank_rate(amount); total=loan_total(amount,rate)
         await interaction.response.send_message(
             embed=embed("💳 Підтвердження кредиту",
@@ -3419,7 +3460,7 @@ class LoanDueView(discord.ui.View):
             view=None)
 
 def valid_player_loan(principal, rate, days):
-    return 1_000 <= principal <= MAX_BET and 0.1 <= rate <= 70 and 1 <= days <= 365
+    return 1_000 <= principal <= MAX_BET and 0.1 <= rate <= 70 and 1 <= days <= MAX_LOAN_DAYS
 
 class PlayerLoanModal(discord.ui.Modal):
     def __init__(self, title, target_label):
@@ -3437,7 +3478,7 @@ class PlayerLoanModal(discord.ui.Modal):
         except ValueError:
             await interaction.response.send_message("❌ Перевір суму, відсоток та кількість днів.",ephemeral=True); return None
         if not valid_player_loan(amount,rate,days):
-            await interaction.response.send_message("❌ Сума: 1 000+; відсоток: 0.1–70%; термін: 1–365 днів.",ephemeral=True); return None
+            await interaction.response.send_message("❌ Сума: 1 000+; відсоток: 0.1–70%; термін: 1–10 днів.",ephemeral=True); return None
         return target,amount,rate,days
 
 class PlayerBorrowModal(PlayerLoanModal):
@@ -3529,7 +3570,7 @@ class CounterLoanModal(discord.ui.Modal,title="Нові умови кредит�
     async def on_submit(self,interaction):
         try:amount=int(self.amount.value.replace(" ",""));rate=float(self.rate.value.replace(",","."));days=int(self.days.value)
         except ValueError:return await interaction.response.send_message("❌ Невірні умови.",ephemeral=True)
-        if not valid_player_loan(amount,rate,days):return await interaction.response.send_message("❌ Сума від 1 000, відсоток 0.1–70%, термін 1–365 днів.",ephemeral=True)
+        if not valid_player_loan(amount,rate,days):return await interaction.response.send_message("❌ Сума від 1 000, відсоток 0.1–70%, термін 1–10 днів.",ephemeral=True)
         conn=db();offer=conn.execute("SELECT * FROM loan_offers WHERE offer_id=? AND status='pending'",(self.offer_id,)).fetchone()
         if not offer:conn.close();return await interaction.response.send_message("❌ Пропозиція вже недійсна.",ephemeral=True)
         # Counteroffer keeps the same lender/borrower roles and goes back to original proposer.
@@ -3871,6 +3912,87 @@ async def send_database_report(interaction: discord.Interaction):
             await interaction.followup.send(embed=e, ephemeral=True)
 
 
+
+class BankBlockReasonModal(discord.ui.Modal, title="Причина блокування банку"):
+    reason = discord.ui.TextInput(label="Причина (необов'язково)", placeholder="Наприклад: систематичне прострочення", required=False, max_length=300)
+    def __init__(self, target: discord.Member, unblock=False):
+        super().__init__(); self.target=target; self.unblock=unblock
+    async def on_submit(self, interaction):
+        if not is_admin(interaction.user.id): return await admin_denied(interaction)
+        reason=self.reason.value.strip() or ("Причина не вказана." if self.unblock else "Рішення адміністрації.")
+        conn=db(); conn.execute("UPDATE users SET bank_banned=?, bank_ban_reason=? WHERE user_id=?", (0 if self.unblock else 1, None if self.unblock else reason, self.target.id)); conn.commit(); conn.close()
+        if self.unblock:
+            await safe_dm(self.target.id, embed_obj=embed("🏦 Банк розблоковано", f"Ваш банк було розблоковано адміністрацією.\n\nПричина: **{reason}**", discord.Color.green()))
+            msg=f"Адміністратор **{interaction.user}** розблокував банк гравця **{self.target}**. Причина: **{reason}**"
+        else:
+            await safe_dm(self.target.id, embed_obj=embed("🚫 Банк заблоковано", f"Ваш доступ до кредитів банку заблоковано адміністрацією.\n\nПричина: **{reason}**", discord.Color.red()))
+            msg=f"Адміністратор **{interaction.user}** заблокував банк гравця **{self.target}**. Причина: **{reason}**"
+        asyncio.create_task(log_purchase(msg))
+        await interaction.response.send_message("✅ Готово.", ephemeral=True)
+
+class BankUserSelect(discord.ui.UserSelect):
+    def __init__(self, unblock=False):
+        super().__init__(placeholder="Оберіть користувача", min_values=1, max_values=1)
+        self.unblock=unblock
+    async def callback(self, interaction):
+        if not is_admin(interaction.user.id): return await admin_denied(interaction)
+        await interaction.response.send_modal(BankBlockReasonModal(self.values[0], self.unblock))
+
+class BankUserView(discord.ui.View):
+    def __init__(self, unblock=False):
+        super().__init__(timeout=300); self.add_item(BankUserSelect(unblock))
+
+class GrantVehicleView(discord.ui.View):
+    def __init__(self, owner_id):
+        super().__init__(timeout=300); self.owner_id=owner_id
+        for rarity, data in CASE_DATA.items():
+            options=[discord.SelectOption(label=name[:100], value=name, description=f"{money(value)} 💰") for name,value,_ in data["cars"]]
+            select=discord.ui.Select(placeholder=f"🚗 {rarity}", options=options, row=list(CASE_DATA.keys()).index(rarity))
+            async def cb(interaction, select=select):
+                if interaction.user.id != self.owner_id: return await interaction.response.send_message("❌ Це меню доступне лише власнику.", ephemeral=True)
+                await interaction.response.edit_message(content=f"🚗 Обрано автомобіль: **{select.values[0]}**\nТепер відмітьте користувача.", embed=None, view=GrantTargetView(self.owner_id, "car", select.values[0]))
+            select.callback=cb; self.add_item(select)
+
+class GrantBusinessView(discord.ui.View):
+    def __init__(self, owner_id):
+        super().__init__(timeout=300); self.owner_id=owner_id
+        options=[discord.SelectOption(label=n[:100], value=n, description=f"{money(p)} | +{money(h)}/год.") for n,p,h in BUSINESSES]
+        sel=discord.ui.Select(placeholder="Оберіть бізнес", options=options)
+        async def cb(interaction):
+            if interaction.user.id != self.owner_id: return await interaction.response.send_message("❌ Це меню доступне лише власнику.", ephemeral=True)
+            await interaction.response.edit_message(content=f"🏢 Обрано: **{sel.values[0]}**\nТепер відмітьте користувача.", embed=None, view=GrantTargetView(self.owner_id, "business", sel.values[0]))
+        sel.callback=cb; self.add_item(sel)
+
+class GrantTargetView(discord.ui.View):
+    def __init__(self, owner_id, item_type, item_key):
+        super().__init__(timeout=300); self.owner_id=owner_id; self.item_type=item_type; self.item_key=item_key
+        select=discord.ui.UserSelect(placeholder="Оберіть користувача", min_values=1, max_values=1)
+        async def cb(interaction):
+            if interaction.user.id != self.owner_id: return await interaction.response.send_message("❌ Це меню доступне лише власнику.", ephemeral=True)
+            target=select.values[0]; ensure_user(target.id,target.name)
+            if self.item_type == "car":
+                add_inventory_item(target.id,"car",self.item_key,1)
+                conn=db(); row=conn.execute("SELECT active_car FROM users WHERE user_id=?",(target.id,)).fetchone()
+                if not row["active_car"]: conn.execute("UPDATE users SET active_car=? WHERE user_id=?",(self.item_key,target.id))
+                conn.commit(); conn.close()
+                text=f"🚗 Автомобіль **{self.item_key}** видано {target.mention}."
+            else:
+                if find_inventory_item(target.id, "business", self.item_key):
+                    return await interaction.response.send_message("❌ У цього гравця такий бізнес уже є.", ephemeral=True)
+                add_inventory_item(target.id,"business",self.item_key,1)
+                name, price, hourly = BUSINESS_BY_NAME[self.item_key]
+                now=datetime.now(timezone.utc).isoformat()
+                conn=db()
+                active=conn.execute("SELECT active_business FROM users WHERE user_id=?",(target.id,)).fetchone()["active_business"]
+                if not active: conn.execute("UPDATE users SET active_business=? WHERE user_id=?",(self.item_key,target.id))
+                conn.execute("INSERT INTO businesses(user_id,business_name,price,hourly_profit,last_paid_at) VALUES(?,?,?,?,?)",(target.id,name,price,hourly,now))
+                conn.commit(); conn.close()
+                text=f"🏢 Бізнес **{self.item_key}** видано {target.mention}." + (" Він став активним." if not active else " Він доданий до інвентарю; активним залишається поточний бізнес.")
+            await safe_dm(target.id,embed_obj=embed("🎁 Вам видано майно",text,discord.Color.green()))
+            asyncio.create_task(log_purchase(f"Адміністратор **{interaction.user}** видав гравцю **{target}**: **{self.item_key}** ({self.item_type})."))
+            await interaction.response.edit_message(content=text,view=None)
+        select.callback=cb; self.add_item(select)
+
 class AdminView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=600)
@@ -3911,6 +4033,24 @@ class AdminView(discord.ui.View):
         if not is_owner(interaction.user.id):
             return await admin_denied(interaction)
         await interaction.response.send_modal(TakeAdminModal())
+
+    @discord.ui.button(label="Блокувати банк", emoji="🚫", style=discord.ButtonStyle.danger, row=3)
+    async def block_bank_btn(self, interaction, button):
+        if await self.check(interaction): await interaction.response.send_message("Оберіть користувача:", view=BankUserView(False), ephemeral=True)
+
+    @discord.ui.button(label="Розблокувати банк", emoji="🔓", style=discord.ButtonStyle.success, row=3)
+    async def unblock_bank_btn(self, interaction, button):
+        if await self.check(interaction): await interaction.response.send_message("Оберіть користувача:", view=BankUserView(True), ephemeral=True)
+
+    @discord.ui.button(label="Видати авто", emoji="🚗", style=discord.ButtonStyle.primary, row=4)
+    async def give_vehicle_btn(self, interaction, button):
+        if not is_owner(interaction.user.id): return await admin_denied(interaction)
+        await interaction.response.send_message("Оберіть автомобіль:", view=GrantVehicleView(interaction.user.id), ephemeral=True)
+
+    @discord.ui.button(label="Видати бізнес", emoji="🏢", style=discord.ButtonStyle.primary, row=4)
+    async def give_business_btn(self, interaction, button):
+        if not is_owner(interaction.user.id): return await admin_denied(interaction)
+        await interaction.response.send_message("Оберіть бізнес:", view=GrantBusinessView(interaction.user.id), ephemeral=True)
 
     @discord.ui.button(label="База даних", emoji="🗄️", style=discord.ButtonStyle.secondary, row=3)
     async def database_info_btn(self, interaction, button):
@@ -3977,6 +4117,40 @@ async def setadmin(interaction: discord.Interaction, user: discord.Member, enabl
         await give_admin(interaction, user)
     else:
         await take_admin(interaction, user)
+
+@bot.tree.command(name="block_bank", description="🔒 Заблокувати банківські кредити")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(user="Користувач", reason="Причина (необов'язково)")
+async def block_bank(interaction: discord.Interaction, user: discord.Member, reason: str = ""):
+    if not is_admin(interaction.user.id): return await admin_denied(interaction)
+    reason=reason.strip() or "Рішення адміністрації."
+    conn=db(); conn.execute("UPDATE users SET bank_banned=1, bank_ban_reason=? WHERE user_id=?",(reason,user.id)); conn.commit(); conn.close()
+    await safe_dm(user.id,embed_obj=embed("🚫 Банк заблоковано",f"Ваш доступ до кредитів банку заблоковано.\n\nПричина: **{reason}**",discord.Color.red()))
+    asyncio.create_task(log_purchase(f"Адміністратор **{interaction.user}** заблокував банк гравця **{user}**. Причина: **{reason}**"))
+    await interaction.response.send_message(f"✅ Банк {user.mention} заблоковано.",ephemeral=True)
+
+@bot.tree.command(name="unblock_bank", description="🔓 Розблокувати банківські кредити")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(user="Користувач", reason="Причина (необов'язково)")
+async def unblock_bank(interaction: discord.Interaction, user: discord.Member, reason: str = ""):
+    if not is_admin(interaction.user.id): return await admin_denied(interaction)
+    reason=reason.strip()
+    conn=db(); conn.execute("UPDATE users SET bank_banned=0, bank_ban_reason=NULL WHERE user_id=?",(user.id,)); conn.commit(); conn.close()
+    if reason: await safe_dm(user.id,embed_obj=embed("🏦 Банк розблоковано",f"Ваш банк було розблоковано адміністрацією.\n\nПричина: **{reason}**",discord.Color.green()))
+    asyncio.create_task(log_purchase(f"Адміністратор **{interaction.user}** розблокував банк гравця **{user}**." + (f" Причина: **{reason}**" if reason else "")))
+    await interaction.response.send_message(f"✅ Банк {user.mention} розблоковано.",ephemeral=True)
+
+@bot.tree.command(name="give_vehicle", description="🔒 Видати автомобіль користувачу")
+@app_commands.default_permissions(administrator=True)
+async def give_vehicle(interaction: discord.Interaction):
+    if not is_owner(interaction.user.id): return await admin_denied(interaction)
+    await interaction.response.send_message("🚗 Оберіть автомобіль:",view=GrantVehicleView(interaction.user.id),ephemeral=True)
+
+@bot.tree.command(name="give_business", description="🔒 Видати бізнес користувачу")
+@app_commands.default_permissions(administrator=True)
+async def give_business(interaction: discord.Interaction):
+    if not is_owner(interaction.user.id): return await admin_denied(interaction)
+    await interaction.response.send_message("🏢 Оберіть бізнес:",view=GrantBusinessView(interaction.user.id),ephemeral=True)
 
 @bot.tree.command(name="msg_send", description="🔒 Надіслати повідомлення користувачу в лс")
 @app_commands.default_permissions(administrator=True)
