@@ -2211,18 +2211,18 @@ class BatchCaseResultView(discord.ui.View):
             )
 
         description = (
-            f"{data['emoji']} **Рідкість:** {self.rarity}\\n"
-            f"📦 **Відкрито кейсів:** {len(self.results)}\\n\\n"
+            f"{data['emoji']} **Рідкість:** {self.rarity}\n"
+            f"📦 **Відкрито кейсів:** {len(self.results)}\n\n"
             + "\n".join(lines)
-            + f"\\n\\n📊 **Забрано:** {claimed} • **Продано:** {sold} • **Залишилось:** {len(pending)}"
+            + f"\n\n📊 **Забрано:** {claimed} • **Продано:** {sold} • **Залишилось:** {len(pending)}"
         )
         if pending:
             description += (
-                f"\\n💰 Сума вартості доступних машин: **{money(total_value)} грн**"
-                "\\n\\n👇 Обери машину нижче для окремої дії або скористайся масовою кнопкою."
+                f"\n💰 Сума вартості доступних машин: **{money(total_value)} грн**"
+                "\n\n👇 Обери машину нижче для окремої дії або скористайся масовою кнопкою."
             )
         else:
-            description += "\\n\\n✅ **Усі машини вже оброблені.**"
+            description += "\n\n✅ **Усі машини вже оброблені.**"
 
         title = "🎰 Результати відкриття кейсів!" if any(x["jackpot"] for x in self.results) else "🎁 Результати відкриття кейсів"
         return embed(title, description, discord.Color.gold() if any(x["jackpot"] for x in self.results) else discord.Color.blurple())
@@ -2365,7 +2365,7 @@ class CarResultView(discord.ui.View):
         conn.commit(); conn.close()
         for item in self.children: item.disabled = True
         await log_purchase(f"Гравець **{interaction.user}** (<@{interaction.user.id}>) забрав з кейса автомобіль **{self.car_name}** вартістю **{money(self.car_value)} грн.**")
-        await interaction.response.edit_message(embed=embed("🚗 Машину забрано", f"**{self.car_name}** додано до твого інвентарю.\\n\\nПеревір `/inventory` або профіль.", discord.Color.green()), view=self)
+        await interaction.response.edit_message(embed=embed("🚗 Машину забрано", f"**{self.car_name}** додано до твого інвентарю.\n\nПеревір `/inventory` або профіль.", discord.Color.green()), view=self)
         await send_garage_offer(interaction.user.id)
 
     @discord.ui.button(label="Продати", emoji="💰", style=discord.ButtonStyle.danger)
@@ -3281,11 +3281,11 @@ class GarageCommandView(discord.ui.View):
         await interaction.response.edit_message(
             embed=embed(
                 "🏢 Вибір гаража",
-                f"🚗 **Автомобіль:** {u['active_car']}\\n\\n"
-                "Гараж захищає автомобіль від викрадення та регулярно перевіряє безпеку.\\n\\n"
-                "🏠 **Звичайний** — 50 000 грн • ризик 10% на день\\n"
-                "🅿️ **Середній** — 250 000 грн • ризик 2% на день\\n"
-                "🏦 **Надійний** — 1 000 000 грн • ризик 0,001% на день\\n\\n"
+                f"🚗 **Автомобіль:** {u['active_car']}\n\n"
+                "Гараж захищає автомобіль від викрадення та регулярно перевіряє безпеку.\n\n"
+                "🏠 **Звичайний** — 50 000 грн • ризик 10% на день\n"
+                "🅿️ **Середній** — 250 000 грн • ризик 2% на день\n"
+                "🏦 **Надійний** — 1 000 000 грн • ризик 0,001% на день\n\n"
                 "⚠️ Повністю виключити ризик викрадення не може жоден гараж.",
                 discord.Color.blurple()
             ),
@@ -3299,7 +3299,7 @@ class GarageCommandView(discord.ui.View):
         await interaction.response.edit_message(
             embed=embed(
                 "❌ Купівлю скасовано",
-                "Ти не купив гараж.\\n\\nКоли захочеш придбати захист для автомобіля, просто введи **/garage**.",
+                "Ти не купив гараж.\n\nКоли захочеш придбати захист для автомобіля, просто введи **/garage**.",
                 discord.Color.greyple()
             ),
             view=self
@@ -3316,9 +3316,9 @@ async def garage(interaction: discord.Interaction):
         await interaction.response.send_message(
             embed=embed(
                 "🅿️ Твій гараж",
-                f"🚗 **Автомобіль:** {u['active_car'] or '—'}\\n"
-                f"🏢 **Гараж:** {u['garage_type']}\\n"
-                f"🛡️ **Ризик викрадення:** {(data.get('risk', 0)*100):g}% на день\\n\\n"
+                f"🚗 **Автомобіль:** {u['active_car'] or '—'}\n"
+                f"🏢 **Гараж:** {u['garage_type']}\n"
+                f"🛡️ **Ризик викрадення:** {(data.get('risk', 0)*100):g}% на день\n\n"
                 "Твій автомобіль уже захищений гаражем.",
                 discord.Color.green()
             ),
@@ -3329,7 +3329,7 @@ async def garage(interaction: discord.Interaction):
         return await interaction.response.send_message(
             embed=embed(
                 "🅿️ Гараж",
-                "Щоб придбати гараж, спочатку потрібно мати **активний автомобіль**.\\n\\n"
+                "Щоб придбати гараж, спочатку потрібно мати **активний автомобіль**.\n\n"
                 "Після отримання машини ти зможеш повернутися сюди через **/garage**.",
                 discord.Color.orange()
             ),
@@ -3338,9 +3338,9 @@ async def garage(interaction: discord.Interaction):
     await interaction.response.send_message(
         embed=embed(
             "🛡️ Захист автомобіля",
-            f"🚗 **Твій автомобіль:** {u['active_car']}\\n\\n"
+            f"🚗 **Твій автомобіль:** {u['active_car']}\n\n"
             "Гараж захищає автомобіль від викрадення. Навіть у гаражі залишається "
-            "невеликий ризик, але кращі гаражі значно підвищують безпеку.\\n\\n"
+            "невеликий ризик, але кращі гаражі значно підвищують безпеку.\n\n"
             "Обери **«Купити гараж»**, щоб переглянути доступні варіанти, "
             "або **«Скасувати»**, якщо поки не хочеш купувати.",
             discord.Color.orange()
