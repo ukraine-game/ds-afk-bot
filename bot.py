@@ -22,6 +22,7 @@ ROLE_ADMIN_ID = 1542839885055004672
 OWNER_ID = 1455564327351226380
 PURCHASE_LOG_CHANNEL_ID = 1543243790943391764
 SYSTEM_LOG_CHANNEL_ID = 1543244165805117600
+ADMIN_LOG_CHANNEL_ID = 1543248471102984222
 MAX_LOAN_DAYS = 10
 
 # Discord CDN emoji links used by the server's embeds.
@@ -2092,7 +2093,7 @@ class CasePurchaseView(discord.ui.View):
             return False
         return True
 
-    @discord.ui.button(label="Відкрити зараз", emoji="🎁", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="Відкрити в одному вікні", emoji="🎁", style=discord.ButtonStyle.success)
     async def open_now(self, interaction: discord.Interaction, button):
         if self.used:
             return await interaction.response.send_message("❌ Ця покупка вже оброблена.", ephemeral=True)
@@ -2142,66 +2143,252 @@ async def send_case_chances(interaction: discord.Interaction):
             await interaction.followup.send(embed=e, ephemeral=True)
 
 
+class BatchCaseResultView(discord.ui.View):
+    """One compact menu for a multi-case opening.
+
+    Nothing is committed to the player's inventory until they choose Claim.
+    This prevents the old behaviour where 10 cases produced 10 separate menus.
+    """
+
+    def __init__(self, owner_id: int, rarity: str, results):
+        super().__init__(timeout=600)
+        self.owner_id = owner_id
+        self.rarity = rarity
+        self.results = [
+            {"name": name, "value": value, "jackpot": jackpot, "chance": chance, "status": "pending"}
+            for name, value, jackpot, chance in results
+        ]
+        self.lock = asyncio.Lock()
+        self.selected_index = 0
+
+        options = []
+        for i, item in enumerate(self.results):
+            marker = "🎰 " if item["jackpot"] else "🚗 "
+            options.append(discord.SelectOption(
+                label=f"{i + 1}. {item['name']}"[:100],
+                description=f"{money(item['value'])} грн • {'джекпот' if item['jackpot'] else 'авто'}",
+                emoji=marker.strip(),
+                value=str(i)
+            ))
+        if options:
+            select = discord.ui.Select(
+                placeholder="🚗 Обери одну машину для окремої дії",
+                options=options[:25],
+                row=1
+            )
+            select.callback = self.select_car
+            self.add_item(select)
+
+    async def interaction_check(self, interaction: discord.Interaction):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "❌ Це меню належить гравцю, який відкрив кейси.", ephemeral=True
+            )
+            return False
+        return True
+
+    def pending(self):
+        return [x for x in self.results if x["status"] == "pending"]
+
+    def build_embed(self):
+        data = CASE_DATA[self.rarity]
+        pending = self.pending()
+        claimed = sum(x["status"] == "claimed" for x in self.results)
+        sold = sum(x["status"] == "sold" for x in self.results)
+        total_value = sum(x["value"] for x in pending)
+
+        lines = []
+        for i, item in enumerate(self.results, 1):
+            if item["status"] == "claimed":
+                state = "🚗 **ЗАБРАНО**"
+            elif item["status"] == "sold":
+                state = "💰 **ПРОДАНО**"
+            else:
+                state = "🟢 **ДОСТУПНО**"
+            jackpot = " 🎰" if item["jackpot"] else ""
+            lines.append(
+                f"`{i:02}` • {state} • **{item['name']}** — {money(item['value'])} грн{jackpot}"
+            )
+
+        description = (
+            f"{data['emoji']} **Рідкість:** {self.rarity}\\n"
+            f"📦 **Відкрито кейсів:** {len(self.results)}\\n\\n"
+            + "\n".join(lines)
+            + f"\\n\\n📊 **Забрано:** {claimed} • **Продано:** {sold} • **Залишилось:** {len(pending)}"
+        )
+        if pending:
+            description += (
+                f"\\n💰 Сума вартості доступних машин: **{money(total_value)} грн**"
+                "\\n\\n👇 Обери машину нижче для окремої дії або скористайся масовою кнопкою."
+            )
+        else:
+            description += "\\n\\n✅ **Усі машини вже оброблені.**"
+
+        title = "🎰 Результати відкриття кейсів!" if any(x["jackpot"] for x in self.results) else "🎁 Результати відкриття кейсів"
+        return embed(title, description, discord.Color.gold() if any(x["jackpot"] for x in self.results) else discord.Color.blurple())
+
+    def refresh_buttons(self):
+        pending = self.pending()
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                if child.custom_id in {"batch_claim", "batch_sell"}:
+                    child.disabled = not bool(pending)
+                elif child.custom_id in {"single_claim", "single_sell"}:
+                    child.disabled = not (
+                        0 <= self.selected_index < len(self.results)
+                        and self.results[self.selected_index]["status"] == "pending"
+                    )
+
+    async def select_car(self, interaction: discord.Interaction):
+        select = next((x for x in self.children if isinstance(x, discord.ui.Select)), None)
+        if not select:
+            return await interaction.response.send_message("❌ Не вдалося знайти вибір машини.", ephemeral=True)
+        self.selected_index = int(select.values[0])
+        item = self.results[self.selected_index]
+        await interaction.response.send_message(
+            f"🚗 Обрано **{item['name']}** — **{money(item['value'])} грн**.\n"
+            "Тепер натисни **«Забрати обрану»** або **«Продати обрану»**.",
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="Забрати все", emoji="🚗", style=discord.ButtonStyle.success, row=0, custom_id="batch_claim")
+    async def claim_all(self, interaction: discord.Interaction, button):
+        async with self.lock:
+            pending = self.pending()
+            if not pending:
+                return await interaction.response.send_message("❌ Усі машини вже оброблені.", ephemeral=True)
+            for item in pending:
+                add_inventory_item(self.owner_id, "car", item["name"], 1)
+                item["status"] = "claimed"
+            conn = db()
+            row = conn.execute("SELECT active_car FROM users WHERE user_id=?", (self.owner_id,)).fetchone()
+            if row and not row["active_car"] and self.results:
+                first_claimed = next((x for x in self.results if x["status"] == "claimed"), None)
+                if first_claimed:
+                    conn.execute("UPDATE users SET active_car=? WHERE user_id=?", (first_claimed["name"], self.owner_id))
+            conn.commit()
+            conn.close()
+
+            total = sum(x["value"] for x in pending)
+            await log_purchase(
+                f"Гравець <@{self.owner_id}> забрав **усі {len(pending)} автомобілі** з відкриття {self.rarity} кейсів. "
+                f"Загальна вартість: **{money(total)} грн.**"
+            )
+            for x in self.results:
+                if x["status"] == "claimed":
+                    pass
+            self.refresh_buttons()
+            await interaction.response.edit_message(embed=self.build_embed(), view=self)
+        await send_garage_offer(self.owner_id)
+
+    @discord.ui.button(label="Продати все", emoji="💰", style=discord.ButtonStyle.danger, row=0, custom_id="batch_sell")
+    async def sell_all(self, interaction: discord.Interaction, button):
+        async with self.lock:
+            pending = self.pending()
+            if not pending:
+                return await interaction.response.send_message("❌ Усі машини вже оброблені.", ephemeral=True)
+            total = sum(x["value"] for x in pending)
+            money_add(self.owner_id, total)
+            for item in pending:
+                item["status"] = "sold"
+            await log_purchase(
+                f"Гравець <@{self.owner_id}> продав **усі {len(pending)} автомобілі** з відкриття {self.rarity} кейсів "
+                f"за **{money(total)} грн.**"
+            )
+            self.refresh_buttons()
+            await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="Забрати обрану", emoji="🚗", style=discord.ButtonStyle.primary, row=2, custom_id="single_claim")
+    async def claim_selected(self, interaction: discord.Interaction, button):
+        async with self.lock:
+            if not (0 <= self.selected_index < len(self.results)):
+                return await interaction.response.send_message("❌ Спочатку обери машину.", ephemeral=True)
+            item = self.results[self.selected_index]
+            if item["status"] != "pending":
+                return await interaction.response.send_message("❌ Ця машина вже оброблена.", ephemeral=True)
+            add_inventory_item(self.owner_id, "car", item["name"], 1)
+            conn = db()
+            row = conn.execute("SELECT active_car FROM users WHERE user_id=?", (self.owner_id,)).fetchone()
+            if row and not row["active_car"]:
+                conn.execute("UPDATE users SET active_car=? WHERE user_id=?", (item["name"], self.owner_id))
+            conn.commit()
+            conn.close()
+            item["status"] = "claimed"
+            await log_purchase(
+                f"Гравець <@{self.owner_id}> забрав автомобіль **{item['name']}** "
+                f"({money(item['value'])} грн.) з відкриття кейсів."
+            )
+            self.refresh_buttons()
+            await interaction.response.edit_message(embed=self.build_embed(), view=self)
+        await send_garage_offer(self.owner_id)
+
+    @discord.ui.button(label="Продати обрану", emoji="💵", style=discord.ButtonStyle.secondary, row=2, custom_id="single_sell")
+    async def sell_selected(self, interaction: discord.Interaction, button):
+        async with self.lock:
+            if not (0 <= self.selected_index < len(self.results)):
+                return await interaction.response.send_message("❌ Спочатку обери машину.", ephemeral=True)
+            item = self.results[self.selected_index]
+            if item["status"] != "pending":
+                return await interaction.response.send_message("❌ Ця машина вже оброблена.", ephemeral=True)
+            money_add(self.owner_id, item["value"])
+            item["status"] = "sold"
+            await log_purchase(
+                f"Гравець <@{self.owner_id}> продав автомобіль **{item['name']}** "
+                f"({money(item['value'])} грн.) з відкриття кейсів."
+            )
+            self.refresh_buttons()
+            await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+
+# Backward-compatible single-result view for one case opened from /inventory.
 class CarResultView(discord.ui.View):
     def __init__(self, owner_id: int, car_name: str, car_value: int):
         super().__init__(timeout=300)
-        self.owner_id = owner_id
-        self.car_name = car_name
-        self.car_value = car_value
-        self.done = False
+        self.owner_id, self.car_name, self.car_value, self.done = owner_id, car_name, car_value, False
 
-    async def interaction_check(self, interaction: discord.Interaction):
+    async def interaction_check(self, interaction):
         if interaction.user.id != self.owner_id:
             await interaction.response.send_message("❌ Ці кнопки доступні лише тому, хто відкрив кейс.", ephemeral=True)
             return False
         return True
 
     @discord.ui.button(label="Забрати", emoji="🚗", style=discord.ButtonStyle.success)
-    async def claim(self, interaction: discord.Interaction, button):
+    async def claim(self, interaction, button):
         if self.done:
             return await interaction.response.send_message("❌ Цю машину вже оброблено.", ephemeral=True)
         self.done = True
         add_inventory_item(interaction.user.id, "car", self.car_name, 1)
-        conn=db()
-        row=conn.execute("SELECT active_car FROM users WHERE user_id=?",(interaction.user.id,)).fetchone()
-        if not row["active_car"]:
-            conn.execute("UPDATE users SET active_car=? WHERE user_id=?",(self.car_name,interaction.user.id))
+        conn = db()
+        row = conn.execute("SELECT active_car FROM users WHERE user_id=?", (interaction.user.id,)).fetchone()
+        if row and not row["active_car"]:
+            conn.execute("UPDATE users SET active_car=? WHERE user_id=?", (self.car_name, interaction.user.id))
         conn.commit(); conn.close()
-        for item in self.children: item.disabled=True
-        asyncio.create_task(log_purchase(f"Гравець **{interaction.user}** (<@{interaction.user.id}>) забрав з кейса автомобіль **{self.car_name}** вартістю **{money(self.car_value)} грн.**"))
-        await interaction.response.edit_message(
-            embed=embed("🚗 Машину забрано", f"**{self.car_name}** додано до твого інвентарю.\n\nПеревір `/inventory` або профіль.", discord.Color.green()),
-            view=self
-        )
-        # Immediately offer a garage in DM; the background loop also catches
-        # cars acquired while the bot was offline.
+        for item in self.children: item.disabled = True
+        await log_purchase(f"Гравець **{interaction.user}** (<@{interaction.user.id}>) забрав з кейса автомобіль **{self.car_name}** вартістю **{money(self.car_value)} грн.**")
+        await interaction.response.edit_message(embed=embed("🚗 Машину забрано", f"**{self.car_name}** додано до твого інвентарю.\\n\\nПеревір `/inventory` або профіль.", discord.Color.green()), view=self)
         await send_garage_offer(interaction.user.id)
 
     @discord.ui.button(label="Продати", emoji="💰", style=discord.ButtonStyle.danger)
-    async def sell(self, interaction: discord.Interaction, button):
+    async def sell(self, interaction, button):
         if self.done:
             return await interaction.response.send_message("❌ Цю машину вже оброблено.", ephemeral=True)
         self.done = True
         money_add(interaction.user.id, self.car_value)
-        for item in self.children: item.disabled=True
-        await interaction.response.edit_message(
-            embed=embed("💰 Машину продано", f"**{self.car_name}** продано державі за **{money(self.car_value)}** 💰.", discord.Color.gold()),
-            view=self
-        )
+        for item in self.children: item.disabled = True
+        await log_purchase(f"Гравець **{interaction.user}** (<@{interaction.user.id}>) продав з кейса автомобіль **{self.car_name}** за **{money(self.car_value)} грн.**")
+        await interaction.response.edit_message(embed=embed("💰 Машину продано", f"**{self.car_name}** продано державі за **{money(self.car_value)}** 💰.", discord.Color.gold()), view=self)
+
 
 async def open_cases_and_send(interaction: discord.Interaction, rarity: str, quantity: int):
     data = CASE_DATA[rarity]
     results = [roll_case(rarity) for _ in range(quantity)]
-    for name, value, jackpot, chance in results:
-        title = "🎰 ДЖЕКПОТ!" if jackpot else "🎁 Кейс відкрито"
-        text = f"{data['emoji']} Рідкість кейса: **{rarity}**\n\n🚗 Ви отримали: **{name}**\n💰 Вартість машини: **{money(value)}**"
-        if jackpot:
-            text += "\n\n🎰 **ЦЕ ДЖЕКПОТ! Вітаємо!**"
-        await interaction.followup.send(
-            embed=embed(title, text, discord.Color.gold() if jackpot else discord.Color.blurple()),
-            view=CarResultView(interaction.user.id, name, value),
-            ephemeral=True
-        )
+    view = BatchCaseResultView(interaction.user.id, rarity, results)
+    view.refresh_buttons()
+    await interaction.followup.send(
+        embed=view.build_embed(),
+        view=view,
+        ephemeral=True
+    )
 
 
 class InventoryUseView(discord.ui.View):
@@ -2913,6 +3100,17 @@ async def log_purchase(message: str):
 async def log_system(message: str):
     await send_log(SYSTEM_LOG_CHANNEL_ID, message, color=discord.Color.blurple())
 
+async def log_admin_action(interaction: discord.Interaction, action: str):
+    """Dedicated Ukrainian audit log for every successful admin action."""
+    actor = interaction.user
+    guild_name = interaction.guild.name if interaction.guild else "особисті повідомлення"
+    message = (
+        f"👮 **Адміністратор:** {actor.mention} (`{actor.id}`)\n"
+        f"🛠️ **Дія:** {action}\n"
+        f"🏠 **Сервер:** **{discord.utils.escape_markdown(guild_name)}**"
+    )
+    await send_log(ADMIN_LOG_CHANNEL_ID, message, color=discord.Color.dark_red())
+
 async def safe_dm(user_id: int, *, embed_obj=None, content=None, view=None):
     user = bot.get_user(user_id)
     if user is None:
@@ -3003,16 +3201,17 @@ class GarageOfferView(discord.ui.View):
             view=GarageChoiceView(self.owner_id)
         )
 
-    @discord.ui.button(label="Нагадати через 1 год.", emoji="⏰", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="Скасувати", emoji="❌", style=discord.ButtonStyle.secondary)
     async def remind(self, interaction, button):
         conn = db()
-        conn.execute("UPDATE users SET garage_reminder_at=? WHERE user_id=?",
-                     ((datetime.now(timezone.utc)+timedelta(hours=1)).isoformat(), self.owner_id))
+        conn.execute("UPDATE users SET garage_reminder_at=NULL WHERE user_id=?", (self.owner_id,))
         conn.commit(); conn.close()
         for item in self.children: item.disabled = True
         await interaction.response.edit_message(
-            embed=embed("⏰ Нагадування встановлено",
-                        "Добре. Я нагадаю тобі про гараж через **1 годину**.", discord.Color.orange()),
+            embed=embed("❌ Пропозицію скасовано",
+                        "Добре. Покупку гаража скасовано.\n\n"
+                        "Якщо захочеш захистити автомобіль пізніше — скористайся **/garage**.",
+                        discord.Color.greyple()),
             view=self
         )
 
@@ -3060,6 +3259,95 @@ class GarageChoiceView(discord.ui.View):
 
     @discord.ui.button(label="Надійний | 1 мільйон", emoji="🏦", style=discord.ButtonStyle.success)
     async def reliable(self, interaction, button): await self.buy_garage(interaction, "Надійний")
+
+class GarageCommandView(discord.ui.View):
+    def __init__(self, owner_id: int):
+        super().__init__(timeout=600)
+        self.owner_id = owner_id
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("❌ Це меню доступне лише власнику гаража.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Купити гараж", emoji="🅿️", style=discord.ButtonStyle.success)
+    async def buy(self, interaction, button):
+        u = get_user(interaction.user.id, interaction.user.name)
+        if u["garage_type"]:
+            return await interaction.response.send_message("❌ У тебе вже є гараж.", ephemeral=True)
+        if not u["active_car"]:
+            return await interaction.response.send_message("❌ Спочатку придбай або забери автомобіль.", ephemeral=True)
+        await interaction.response.edit_message(
+            embed=embed(
+                "🏢 Вибір гаража",
+                f"🚗 **Автомобіль:** {u['active_car']}\\n\\n"
+                "Гараж захищає автомобіль від викрадення та регулярно перевіряє безпеку.\\n\\n"
+                "🏠 **Звичайний** — 50 000 грн • ризик 10% на день\\n"
+                "🅿️ **Середній** — 250 000 грн • ризик 2% на день\\n"
+                "🏦 **Надійний** — 1 000 000 грн • ризик 0,001% на день\\n\\n"
+                "⚠️ Повністю виключити ризик викрадення не може жоден гараж.",
+                discord.Color.blurple()
+            ),
+            view=GarageChoiceView(self.owner_id)
+        )
+
+    @discord.ui.button(label="Скасувати", emoji="❌", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction, button):
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(
+            embed=embed(
+                "❌ Купівлю скасовано",
+                "Ти не купив гараж.\\n\\nКоли захочеш придбати захист для автомобіля, просто введи **/garage**.",
+                discord.Color.greyple()
+            ),
+            view=self
+        )
+
+
+@bot.tree.command(name="garage", description="Купити гараж та захистити свій автомобіль")
+async def garage(interaction: discord.Interaction):
+    if not normal_channel_only(interaction):
+        return await reject_wrong_channel(interaction)
+    u = get_user(interaction.user.id, interaction.user.name)
+    if u["garage_type"]:
+        data = GARAGES.get(u["garage_type"], {})
+        await interaction.response.send_message(
+            embed=embed(
+                "🅿️ Твій гараж",
+                f"🚗 **Автомобіль:** {u['active_car'] or '—'}\\n"
+                f"🏢 **Гараж:** {u['garage_type']}\\n"
+                f"🛡️ **Ризик викрадення:** {(data.get('risk', 0)*100):g}% на день\\n\\n"
+                "Твій автомобіль уже захищений гаражем.",
+                discord.Color.green()
+            ),
+            ephemeral=True
+        )
+        return
+    if not u["active_car"]:
+        return await interaction.response.send_message(
+            embed=embed(
+                "🅿️ Гараж",
+                "Щоб придбати гараж, спочатку потрібно мати **активний автомобіль**.\\n\\n"
+                "Після отримання машини ти зможеш повернутися сюди через **/garage**.",
+                discord.Color.orange()
+            ),
+            ephemeral=True
+        )
+    await interaction.response.send_message(
+        embed=embed(
+            "🛡️ Захист автомобіля",
+            f"🚗 **Твій автомобіль:** {u['active_car']}\\n\\n"
+            "Гараж захищає автомобіль від викрадення. Навіть у гаражі залишається "
+            "невеликий ризик, але кращі гаражі значно підвищують безпеку.\\n\\n"
+            "Обери **«Купити гараж»**, щоб переглянути доступні варіанти, "
+            "або **«Скасувати»**, якщо поки не хочеш купувати.",
+            discord.Color.orange()
+        ),
+        view=GarageCommandView(interaction.user.id),
+        ephemeral=True
+    )
 
 async def process_garages():
     now = datetime.now(timezone.utc)
@@ -3643,6 +3931,7 @@ async def give_admin(interaction, user: discord.Member):
     except discord.HTTPException:
         pass
 
+    await log_admin_action(interaction, f"Призначив користувача {user.mention} (`{user.id}`) адміністратором.")
     await interaction.response.send_message(f"Адміністратора призначено: {user.mention}.", ephemeral=True)
 
 async def take_admin(interaction, user: discord.Member):
@@ -3656,6 +3945,7 @@ async def take_admin(interaction, user: discord.Member):
             await user.remove_roles(role, reason="Зняття адміністратора ботом")
         except discord.HTTPException:
             pass
+    await log_admin_action(interaction, f"Зняв з користувача {user.mention} (`{user.id}`) права адміністратора.")
     await interaction.response.send_message(f"Адміністратора знято: {user.mention}.", ephemeral=True)
 
 class GiveMoneyModal(discord.ui.Modal, title="Видати гроші"):
@@ -3665,7 +3955,11 @@ class GiveMoneyModal(discord.ui.Modal, title="Видати гроші"):
         if not is_admin(interaction.user.id): return await admin_denied(interaction)
         try: uid, amount = int(self.user_id.value.strip()), int(self.amount.value.strip()); assert amount > 0
         except (ValueError, AssertionError): return await interaction.response.send_message("Невірні дані.", ephemeral=True)
-        money_add(uid, amount); await interaction.response.send_message(f"{uid} отримав {money(amount)}.", ephemeral=True)
+        old = get_user(uid)["balance"]
+        money_add(uid, amount)
+        new = get_user(uid)["balance"]
+        await log_admin_action(interaction, f"Видав гроші користувачу <@{uid}> (`{uid}`). Сума: **{money(amount)} грн**. Баланс: **{money(old)} → {money(new)} грн**.")
+        await interaction.response.send_message(f"{uid} отримав {money(amount)}.", ephemeral=True)
 
 class SetMoneyModal(discord.ui.Modal, title="Встановити гроші"):
     user_id = discord.ui.TextInput(label="ID користувача", placeholder="123456789012345678")
@@ -3675,6 +3969,7 @@ class SetMoneyModal(discord.ui.Modal, title="Встановити гроші"):
         try: uid, amount = int(self.user_id.value.strip()), int(self.amount.value.strip()); assert amount >= 0
         except (ValueError, AssertionError): return await interaction.response.send_message("Невірні дані.", ephemeral=True)
         old = get_user(uid)["balance"]; money_set(uid, amount)
+        await log_admin_action(interaction, f"Встановив баланс користувачу <@{uid}> (`{uid}`). Було: **{money(old)} грн**, стало: **{money(amount)} грн**.")
         await interaction.response.send_message(f"Баланс {uid}: {money(old)} → {money(amount)}.", ephemeral=True)
 
 class SetDickModal(discord.ui.Modal, title="Встановити розмір"):
@@ -3685,6 +3980,7 @@ class SetDickModal(discord.ui.Modal, title="Встановити розмір"):
         try: uid, size = int(self.user_id.value.strip()), int(self.size.value.strip())
         except ValueError: return await interaction.response.send_message("Невірні дані.", ephemeral=True)
         old = get_user(uid)["dick_size"]; dick_set(uid, size)
+        await log_admin_action(interaction, f"Змінив розмір користувачу <@{uid}> (`{uid}`). Було: **{old} см**, стало: **{size} см**.")
         await interaction.response.send_message(f"Розмір {uid}: {old} см → {size} см.", ephemeral=True)
 
 class RigRouletteModal(discord.ui.Modal, title="Накрутка рулетки"):
@@ -3693,7 +3989,9 @@ class RigRouletteModal(discord.ui.Modal, title="Накрутка рулетки"
         if not is_admin(interaction.user.id): return await admin_denied(interaction)
         try: n = int(self.number.value.strip()); assert 1 <= n <= 50
         except (ValueError, AssertionError): return await interaction.response.send_message("Невірне число.", ephemeral=True)
-        set_setting("roulette_next", str(n)); await interaction.response.send_message(f"Наступного разу рулетка спробує показати {n}.", ephemeral=True)
+        set_setting("roulette_next", str(n))
+        await log_admin_action(interaction, f"Накрутив наступний результат рулетки: **{n}**.")
+        await interaction.response.send_message(f"Наступного разу рулетка спробує показати {n}.", ephemeral=True)
 
 class RigCoinModal(discord.ui.Modal, title="Накрутка монетки"):
     result = discord.ui.TextInput(label="Наступний результат", placeholder="Орел або Решка")
@@ -3702,7 +4000,9 @@ class RigCoinModal(discord.ui.Modal, title="Накрутка монетки"):
         value = self.result.value.strip().lower()
         mapping = {"орел": "Орел", "решка": "Решка", "heads": "Орел", "tails": "Решка"}
         if value not in mapping: return await interaction.response.send_message("Напиши Орел або Решка.", ephemeral=True)
-        set_setting("coinflip_next", mapping[value]); await interaction.response.send_message(
+        set_setting("coinflip_next", mapping[value])
+        await log_admin_action(interaction, f"Накрутив наступний результат монетки: **{mapping[value]}**.")
+        await interaction.response.send_message(
             f"🎲 Накрутку встановлено: **{mapping[value]}**. Її отримає **перший наступний прокрут будь-якого користувача**, після чого вона автоматично зникне.",
             ephemeral=True
         )
@@ -3745,6 +4045,7 @@ class MsgSendModal(discord.ui.Modal, title="Надіслати повідомл�
             await member.send(embed=e)
         except discord.HTTPException:
             return await interaction.response.send_message("Не вдалося надіслати повідомлення в особисті повідомлення.", ephemeral=True)
+        await log_admin_action(interaction, f"Надіслав користувачу {member.mention} (`{member.id}`) особисте повідомлення. Текст: **{discord.utils.escape_markdown(str(self.text.value))[:500]}**" + (" (із вкладеним посиланням на медіа)" if self.attachment_url.value.strip() else "") + ".")
         await interaction.response.send_message(f"Повідомлення надіслано {member.mention}.", ephemeral=True)
 
 async def resolve_member(guild, value):
@@ -3899,6 +4200,7 @@ async def send_database_report(interaction: discord.Interaction):
         f"💾 Backups: `{BACKUP_DIR}`"
     )
 
+    await log_admin_action(interaction, "Переглянув повний звіт бази даних.")
     await interaction.response.send_message(
         embed=embed("🗄️ Повна інформація БД", summary, discord.Color.blurple()),
         ephemeral=True
@@ -3928,6 +4230,10 @@ class BankBlockReasonModal(discord.ui.Modal, title="Причина блокув�
             await safe_dm(self.target.id, embed_obj=embed("🚫 Банк заблоковано", f"Ваш доступ до кредитів банку заблоковано адміністрацією.\n\nПричина: **{reason}**", discord.Color.red()))
             msg=f"Адміністратор **{interaction.user}** заблокував банк гравця **{self.target}**. Причина: **{reason}**"
         asyncio.create_task(log_purchase(msg))
+        await log_admin_action(
+            interaction,
+            f"{'Розблокував' if self.unblock else 'Заблокував'} банк користувачу {self.target.mention} (`{self.target.id}`). Причина: **{reason}**."
+        )
         await interaction.response.send_message("✅ Готово.", ephemeral=True)
 
 class BankUserSelect(discord.ui.UserSelect):
@@ -3990,6 +4296,7 @@ class GrantTargetView(discord.ui.View):
                 text=f"🏢 Бізнес **{self.item_key}** видано {target.mention}." + (" Він став активним." if not active else " Він доданий до інвентарю; активним залишається поточний бізнес.")
             await safe_dm(target.id,embed_obj=embed("🎁 Вам видано майно",text,discord.Color.green()))
             asyncio.create_task(log_purchase(f"Адміністратор **{interaction.user}** видав гравцю **{target}**: **{self.item_key}** ({self.item_type})."))
+            await log_admin_action(interaction, f"Видав {('автомобіль' if self.item_type == 'car' else 'бізнес')} **{self.item_key}** користувачу {target.mention} (`{target.id}`).")
             await interaction.response.edit_message(content=text,view=None)
         select.callback=cb; self.add_item(select)
 
@@ -4065,6 +4372,7 @@ class AdminView(discord.ui.View):
 @app_commands.default_permissions(administrator=True)
 async def admin(interaction: discord.Interaction):
     if not is_admin(interaction.user.id): return await admin_denied(interaction)
+    await log_admin_action(interaction, "Відкрив адмін-панель.")
     await interaction.response.send_message(
         embed=embed("🛠️ Адмін-панель", "💰 Економіка • 🍆 Розміри • 🎟️ Промокоди • 🎲 Накрутки • 🗄️ База даних\n\nПанель доступна адміністраторам. Власник також може призначати та знімати адміністраторів.", discord.Color.dark_red()),
         view=AdminView(), ephemeral=True
@@ -4075,7 +4383,11 @@ async def admin(interaction: discord.Interaction):
 @app_commands.describe(user="Користувач", amount="Кількість")
 async def givemoney(interaction: discord.Interaction, user: discord.Member, amount: app_commands.Range[int, 1, MAX_BET]):
     if not is_admin(interaction.user.id): return await admin_denied(interaction)
-    money_add(user.id, amount); await interaction.response.send_message(f"{user.mention} отримав {money(amount)}.", ephemeral=True)
+    old = get_user(user.id, user.name)["balance"]
+    money_add(user.id, amount)
+    new = get_user(user.id, user.name)["balance"]
+    await log_admin_action(interaction, f"Видав гроші {user.mention} (`{user.id}`). Сума: **{money(amount)} грн**. Баланс: **{money(old)} → {money(new)} грн**.")
+    await interaction.response.send_message(f"{user.mention} отримав {money(amount)}.", ephemeral=True)
 
 @bot.tree.command(name="setmoney", description="🔒 Встановити баланс користувачу")
 @app_commands.default_permissions(administrator=True)
@@ -4083,6 +4395,7 @@ async def givemoney(interaction: discord.Interaction, user: discord.Member, amou
 async def setmoney(interaction: discord.Interaction, user: discord.Member, amount: app_commands.Range[int, 0, MAX_BET]):
     if not is_admin(interaction.user.id): return await admin_denied(interaction)
     old = get_user(user.id, user.name)["balance"]; money_set(user.id, amount)
+    await log_admin_action(interaction, f"Встановив баланс {user.mention} (`{user.id}`). Було: **{money(old)} грн**, стало: **{money(amount)} грн**.")
     await interaction.response.send_message(f"Баланс {user.mention}: {money(old)} → {money(amount)}.", ephemeral=True)
 
 @bot.tree.command(name="setdick", description="🔒 Встановити розмір користувачу")
@@ -4091,6 +4404,7 @@ async def setmoney(interaction: discord.Interaction, user: discord.Member, amoun
 async def setdick(interaction: discord.Interaction, user: discord.Member, size: int):
     if not is_admin(interaction.user.id): return await admin_denied(interaction)
     old = get_user(user.id, user.name)["dick_size"]; dick_set(user.id, size)
+    await log_admin_action(interaction, f"Встановив розмір {user.mention} (`{user.id}`). Було: **{old} см**, стало: **{size} см**.")
     await interaction.response.send_message(f"Розмір {user.mention}: {old} см → {size} см.", ephemeral=True)
 
 @bot.tree.command(name="giveadmin", description="🔒 Призначити адміністратора")
@@ -4127,6 +4441,7 @@ async def block_bank(interaction: discord.Interaction, user: discord.Member, rea
     conn=db(); conn.execute("UPDATE users SET bank_banned=1, bank_ban_reason=? WHERE user_id=?",(reason,user.id)); conn.commit(); conn.close()
     await safe_dm(user.id,embed_obj=embed("🚫 Банк заблоковано",f"Ваш доступ до кредитів банку заблоковано.\n\nПричина: **{reason}**",discord.Color.red()))
     asyncio.create_task(log_purchase(f"Адміністратор **{interaction.user}** заблокував банк гравця **{user}**. Причина: **{reason}**"))
+    await log_admin_action(interaction, f"Заблокував банк користувачу {user.mention} (`{user.id}`). Причина: **{reason}**.")
     await interaction.response.send_message(f"✅ Банк {user.mention} заблоковано.",ephemeral=True)
 
 @bot.tree.command(name="unblock_bank", description="🔓 Розблокувати банківські кредити")
@@ -4138,18 +4453,21 @@ async def unblock_bank(interaction: discord.Interaction, user: discord.Member, r
     conn=db(); conn.execute("UPDATE users SET bank_banned=0, bank_ban_reason=NULL WHERE user_id=?",(user.id,)); conn.commit(); conn.close()
     if reason: await safe_dm(user.id,embed_obj=embed("🏦 Банк розблоковано",f"Ваш банк було розблоковано адміністрацією.\n\nПричина: **{reason}**",discord.Color.green()))
     asyncio.create_task(log_purchase(f"Адміністратор **{interaction.user}** розблокував банк гравця **{user}**." + (f" Причина: **{reason}**" if reason else "")))
+    await log_admin_action(interaction, f"Розблокував банк користувачу {user.mention} (`{user.id}`)." + (f" Причина: **{reason}**." if reason else ""))
     await interaction.response.send_message(f"✅ Банк {user.mention} розблоковано.",ephemeral=True)
 
 @bot.tree.command(name="give_vehicle", description="🔒 Видати автомобіль користувачу")
 @app_commands.default_permissions(administrator=True)
 async def give_vehicle(interaction: discord.Interaction):
     if not is_owner(interaction.user.id): return await admin_denied(interaction)
+    await log_admin_action(interaction, "Відкрив меню видачі автомобіля.")
     await interaction.response.send_message("🚗 Оберіть автомобіль:",view=GrantVehicleView(interaction.user.id),ephemeral=True)
 
 @bot.tree.command(name="give_business", description="🔒 Видати бізнес користувачу")
 @app_commands.default_permissions(administrator=True)
 async def give_business(interaction: discord.Interaction):
     if not is_owner(interaction.user.id): return await admin_denied(interaction)
+    await log_admin_action(interaction, "Відкрив меню видачі бізнесу.")
     await interaction.response.send_message("🏢 Оберіть бізнес:",view=GrantBusinessView(interaction.user.id),ephemeral=True)
 
 @bot.tree.command(name="msg_send", description="🔒 Надіслати повідомлення користувачу в лс")
@@ -4164,6 +4482,7 @@ async def msg_send(interaction: discord.Interaction, user: discord.Member, text:
             await user.send(content=text)
     except discord.HTTPException:
         return await interaction.response.send_message("Не вдалося надіслати повідомлення в особисті повідомлення.", ephemeral=True)
+    await log_admin_action(interaction, f"Надіслав користувачу {user.mention} (`{user.id}`) особисте повідомлення: **{discord.utils.escape_markdown(text)[:500]}**" + (" (із вкладенням)." if attachment else "."))
     await interaction.response.send_message(f"Повідомлення надіслано {user.mention}.", ephemeral=True)
 
 @bot.tree.command(name="promo_create", description="🔒 Створити промокод")
@@ -4177,7 +4496,9 @@ async def promo_create(interaction: discord.Interaction, code: str, money_amount
         conn.execute("INSERT INTO promos(code, money, dick, created_by) VALUES (?, ?, ?, ?)", (code, money_amount, dick_amount, interaction.user.id)); conn.commit()
     except sqlite3.IntegrityError:
         conn.close(); return await interaction.response.send_message("Такий промокод уже існує.", ephemeral=True)
-    conn.close(); await interaction.response.send_message(f"Промокод {code} створено. +{money(money_amount)}, {dick_amount:+d} см.", ephemeral=True)
+    conn.close()
+    await log_admin_action(interaction, f"Створив промокод **{code}**: +**{money(money_amount)} грн**, {dick_amount:+d} см.")
+    await interaction.response.send_message(f"Промокод {code} створено. +{money(money_amount)}, {dick_amount:+d} см.", ephemeral=True)
 
 # ---------------- START ----------------
 
