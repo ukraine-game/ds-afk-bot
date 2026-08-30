@@ -3912,7 +3912,7 @@ class CounterLoanModal(discord.ui.Modal,title="Нові умови кредит�
 
 @bot.tree.command(name="bank_offer", description="Запропонувати гравцю кредит")
 @app_commands.describe(user="Кому запропонувати", money="Сума", procent="Відсоток", days="Кількість днів")
-async def bank_offer(interaction: discord.Interaction, user: discord.Member, money: app_commands.Range[int, 1000, MAX_BET], procent: app_commands.Range[float, 0.1, 70], days: app_commands.Range[int, 1, MAX_LOAN_DAYS]):
+async def bank_offer(interaction: discord.Interaction, user: discord.Member, money: app_commands.Range[int, 1000, MAX_BET], procent: app_commands.Range[float, 0.1, 70.0], days: app_commands.Range[int, 1, MAX_LOAN_DAYS]):
     if not normal_channel_only(interaction): return await reject_wrong_channel(interaction)
     if user.bot or user.id == interaction.user.id:
         return await interaction.response.send_message("❌ Обери іншого гравця.", ephemeral=True)
@@ -3925,7 +3925,7 @@ async def bank_offer(interaction: discord.Interaction, user: discord.Member, mon
 
 @bot.tree.command(name="bank_borrow", description="Попросити гравця видати тобі кредит")
 @app_commands.describe(user="У кого попросити", money="Сума", procent="Відсоток", days="Кількість днів")
-async def bank_borrow(interaction: discord.Interaction, user: discord.Member, money: app_commands.Range[int, 1000, MAX_BET], procent: app_commands.Range[float, 0.1, 70], days: app_commands.Range[int, 1, MAX_LOAN_DAYS]):
+async def bank_borrow(interaction: discord.Interaction, user: discord.Member, money: app_commands.Range[int, 1000, MAX_BET], procent: app_commands.Range[float, 0.1, 70.0], days: app_commands.Range[int, 1, MAX_LOAN_DAYS]):
     if not normal_channel_only(interaction): return await reject_wrong_channel(interaction)
     if user.bot or user.id == interaction.user.id:
         return await interaction.response.send_message("❌ Обери іншого гравця.", ephemeral=True)
