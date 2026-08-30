@@ -281,6 +281,7 @@ def _migrate_schema(conn):
             "garage_last_check_at": "TEXT",
             "bank_banned": "INTEGER NOT NULL DEFAULT 0",
             "bank_ban_reason": "TEXT",
+            "stamina": "INTEGER NOT NULL DEFAULT 0",
         },
         "promos": {"created_at": "TEXT NOT NULL DEFAULT ''"},
         "promo_uses": {"used_at": "TEXT NOT NULL DEFAULT ''"},
@@ -464,7 +465,8 @@ def init_db():
         admin INTEGER NOT NULL DEFAULT 0,
         daily_at TEXT,
         dick_at TEXT,
-        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        stamina INTEGER NOT NULL DEFAULT 0
     );
 
     CREATE TABLE IF NOT EXISTS promos (
@@ -687,6 +689,21 @@ def dick_set(user_id: int, amount: int):
     conn.close()
 
 
+def has_stamina(user_id: int) -> bool:
+    return bool(get_user(user_id)["stamina"])
+
+
+def toggle_stamina(user_id: int) -> bool:
+    ensure_user(user_id)
+    conn = db()
+    row = conn.execute("SELECT stamina FROM users WHERE user_id=?", (user_id,)).fetchone()
+    new_value = 0 if row and row[0] else 1
+    conn.execute("UPDATE users SET stamina=? WHERE user_id=?", (new_value, user_id))
+    conn.commit()
+    conn.close()
+    return bool(new_value)
+
+
 def set_cooldown(user_id: int, column: str):
     if column not in ("daily_at", "dick_at"):
         raise ValueError("bad column")
@@ -816,18 +833,18 @@ async def dick(interaction: discord.Interaction):
 
     u = get_user(interaction.user.id, interaction.user.name)
     left = cooldown_left(u["dick_at"])
-    if left.total_seconds() > 0:
+    if not u["stamina"] and left.total_seconds() > 0:
         await interaction.response.send_message(
             f"⏳ Ти вже використовував команду сьогодні. До наступної спроби: **{fmt_duration(left)}**.",
             ephemeral=True,
         )
         return
 
-    # First ever use is guaranteed to be positive.
-    if u["dick_at"] is None:
-        change = random.randint(1, 5)
-    else:
-        change = random.randint(-5, 5)
+    # Weighted random result from -3 to +8. Smaller changes are more common,
+    # while larger positive results remain possible but rare.
+    changes = list(range(-3, 9))
+    weights = [8, 10, 12, 14, 14, 12, 10, 8, 6, 4, 3, 2]
+    change = random.choices(changes, weights=weights, k=1)[0]
 
     new_size = max(0, u["dick_size"] + change)
     conn = db()
@@ -919,7 +936,7 @@ async def daily(interaction: discord.Interaction):
         return await reject_wrong_channel(interaction)
     u = get_user(interaction.user.id, interaction.user.name)
     left = cooldown_left(u["daily_at"])
-    if left.total_seconds() > 0:
+    if not u["stamina"] and left.total_seconds() > 0:
         await interaction.response.send_message(
             f"⏳ Наступний бонус буде доступний через **{fmt_duration(left)}**.", ephemeral=True
         )
@@ -3017,7 +3034,7 @@ async def masturbation(interaction: discord.Interaction):
                              WHERE user_id=? AND status='finished' ORDER BY session_id DESC LIMIT 1""",(interaction.user.id,)).fetchone()
         if last:
             left=cooldown_left(last["finished_at"],MASTURBATION_COOLDOWN)
-            if left.total_seconds()>0:
+            if not get_user(interaction.user.id)["stamina"] and left.total_seconds()>0:
                 conn.rollback()
                 return await interaction.response.send_message(f"⏳ Наступний раз можна через **{fmt_duration(left)}**.",ephemeral=True)
         now=datetime.now(timezone.utc)
@@ -3574,10 +3591,21 @@ class BankConfirmView(discord.ui.View):
                      (self.user_id,self.amount,self.rate,total,datetime.now(timezone.utc).isoformat(),due.isoformat()))
         conn.commit(); conn.close()
         money_add(self.user_id,self.amount)
+        due_ts = int(due.timestamp())
         await interaction.response.edit_message(embed=embed("💳 Кредит оформлено",
             f"Банк зарахував **{money(self.amount)} грн.** на твій баланс.\n\n"
             f"До погашення: **{money(total)} грн.** ({self.rate:.4f}%).\n"
-            f"Термін: **{self.days} дн.**",discord.Color.green()),view=None)
+            f"Термін: **{self.days} дн.**\n"
+            f"📅 Погасити до: <t:{due_ts}:F>\n\n"
+            "Дострокове погашення доступне через `/bank` → **Погасити кредит**.",discord.Color.green()),view=None)
+        await safe_dm(self.user_id, embed_obj=embed(
+            "🏦 Банк схвалив кредит",
+            f"Банк схвалив тобі кредит на **{money(self.amount)} грн.** 💰\n\n"
+            f"📈 Відсоток: **{self.rate:.4f}%**\n"
+            f"📅 Термін: **{self.days} дн.**\n"
+            f"💵 До погашення: **{money(total)} грн.**\n"
+            f"🗓️ Погасити до: <t:{due_ts}:F>\n\n"
+            "Можеш погасити його достроково через `/bank`.", discord.Color.green()))
     @discord.ui.button(label="Відмовитись",emoji="❌",style=discord.ButtonStyle.danger)
     async def no(self,interaction,button):
         self.done=True
@@ -3834,12 +3862,22 @@ class PlayerOfferView(discord.ui.View):
                      (offer["lender_id"],offer["borrower_id"],offer["principal"],offer["rate"],total,now.isoformat(),due.isoformat()))
         conn.execute("UPDATE loan_offers SET status='accepted',updated_at=? WHERE offer_id=?",(now.isoformat(),self.offer_id))
         conn.commit();conn.close()
+        due_ts = int(due.timestamp())
         await interaction.response.edit_message(embed=embed("🤝 Кредит схвалено",
             f"Кредит на **{money(offer['principal'])} грн.** оформлено.\n"
-            f"До погашення: **{money(total)} грн.**",discord.Color.green()),view=None)
+            f"До погашення: **{money(total)} грн.**\n"
+            f"📅 Погасити до: <t:{due_ts}:F>",discord.Color.green()),view=None)
+        await safe_dm(offer["borrower_id"],embed_obj=embed("💳 Кредит схвалено",
+            f"Гравець <@{offer['lender_id']}> схвалив тобі кредит на **{money(offer['principal'])} грн.** 💰\n\n"
+            f"📈 Відсоток: **{offer['rate']:.2f}%**\n"
+            f"📅 Термін: **{offer['days']} дн.**\n"
+            f"💵 До погашення: **{money(total)} грн.**\n"
+            f"🗓️ Погасити до: <t:{due_ts}:F>\n\n"
+            "Достроково погасити можна через `/bank`.",discord.Color.green()))
         await safe_dm(offer["lender_id"],embed_obj=embed("💰 Кредит видано",
             f"<@{offer['borrower_id']}> отримав від тебе **{money(offer['principal'])} грн.**.\n"
-            f"До повернення: **{money(total)} грн.**",discord.Color.green()))
+            f"До повернення: **{money(total)} грн.**\n"
+            f"📅 Погасити до: <t:{due_ts}:F>",discord.Color.green()))
     @discord.ui.button(label="Відмовити",emoji="❌",style=discord.ButtonStyle.danger)
     async def decline(self,interaction,button):
         conn=db();conn.execute("UPDATE loan_offers SET status='declined',updated_at=? WHERE offer_id=? AND status='pending'",
@@ -3872,6 +3910,30 @@ class CounterLoanModal(discord.ui.Modal,title="Нові умови кредит�
             f"💵 До погашення: **{money(loan_total(amount,rate))} грн.**",discord.Color.gold()),
             view=PlayerOfferView(self.offer_id,offer["proposer_id"]))
 
+@bot.tree.command(name="bank_offer", description="Запропонувати гравцю кредит")
+@app_commands.describe(user="Кому запропонувати", money="Сума", procent="Відсоток", days="Кількість днів")
+async def bank_offer(interaction: discord.Interaction, user: discord.Member, money: app_commands.Range[int, 1000, MAX_BET], procent: app_commands.Range[float, 0.1, 70], days: app_commands.Range[int, 1, MAX_LOAN_DAYS]):
+    if not normal_channel_only(interaction): return await reject_wrong_channel(interaction)
+    if user.bot or user.id == interaction.user.id:
+        return await interaction.response.send_message("❌ Обери іншого гравця.", ephemeral=True)
+    if get_user(interaction.user.id, interaction.user.name)["balance"] < money:
+        return await interaction.response.send_message("❌ У тебе недостатньо коштів для цієї пропозиції.", ephemeral=True)
+    await create_player_offer(interaction.user.id, user.id, interaction.user.id, user.id, money, float(procent), days)
+    await interaction.response.send_message(embed=embed("💼 Пропозицію надіслано",
+        f"Гравцю {user.mention} надіслано кредитну пропозицію.\n\n💰 Сума: **{money} грн.**\n📈 Відсоток: **{float(procent):.2f}%**\n📅 Термін: **{days} дн.**\n💵 До погашення: **{loan_total(money, float(procent))} грн.**", discord.Color.gold()), ephemeral=True)
+
+
+@bot.tree.command(name="bank_borrow", description="Попросити гравця видати тобі кредит")
+@app_commands.describe(user="У кого попросити", money="Сума", procent="Відсоток", days="Кількість днів")
+async def bank_borrow(interaction: discord.Interaction, user: discord.Member, money: app_commands.Range[int, 1000, MAX_BET], procent: app_commands.Range[float, 0.1, 70], days: app_commands.Range[int, 1, MAX_LOAN_DAYS]):
+    if not normal_channel_only(interaction): return await reject_wrong_channel(interaction)
+    if user.bot or user.id == interaction.user.id:
+        return await interaction.response.send_message("❌ Обери іншого гравця.", ephemeral=True)
+    await create_player_offer(interaction.user.id, user.id, user.id, interaction.user.id, money, float(procent), days)
+    await interaction.response.send_message(embed=embed("🤝 Заявку надіслано",
+        f"Гравцю {user.mention} надіслано заявку на кредит.\n\n💰 Сума: **{money} грн.**\n📈 Відсоток: **{float(procent):.2f}%**\n📅 Термін: **{days} дн.**\n💵 До погашення: **{loan_total(money, float(procent))} грн.**", discord.Color.blurple()), ephemeral=True)
+
+
 @bot.tree.command(name="bank", description="Відкрити банк та керувати кредитами")
 async def bank(interaction: discord.Interaction):
     if not normal_channel_only(interaction): return await reject_wrong_channel(interaction)
@@ -3886,7 +3948,8 @@ async def bank(interaction: discord.Interaction):
         "💰 **Погасити кредит** — достроково закрити борг.\n"
         "📋 **Кредити** — переглянути активні кредити.\n"
         "🤝 **Кредит від гравця** — подати заявку іншому гравцю.\n"
-        "💼 **Запропонувати кредит** — виступити кредитором.",
+        "💼 **Запропонувати кредит** — виступити кредитором.\n\n"
+        "⚡ **Швидкі команди:** `/bank_offer` — запропонувати кредит гравцю; `/bank_borrow` — попросити кредит у гравця.",
         discord.Color.gold()),view=BankMainView(interaction.user.id))
 
 # ---------------- ADMIN ----------------
@@ -4431,6 +4494,25 @@ async def setadmin(interaction: discord.Interaction, user: discord.Member, enabl
         await give_admin(interaction, user)
     else:
         await take_admin(interaction, user)
+
+@bot.tree.command(name="stamina", description="🔋 Увімкнути/вимкнути безлімітну стаміну користувача")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(user="Користувач")
+async def stamina(interaction: discord.Interaction, user: discord.Member):
+    if not is_admin(interaction.user.id):
+        return await admin_denied(interaction)
+    enabled = toggle_stamina(user.id)
+    status = "увімкнено ♾️" if enabled else "вимкнено 🔒"
+    await log_admin_action(interaction, f"{('Увімкнув' if enabled else 'Вимкнув')} безлімітну стаміну користувачу {user.mention} (`{user.id}`).")
+    await safe_dm(user.id, embed_obj=embed(
+        "🔋 Стаміна",
+        f"Адміністратор **{interaction.user.display_name}** {('увімкнув' if enabled else 'вимкнув')} тобі безлімітну стаміну.\n\nСтатус: **{status}**\n"
+        f"{'Тепер /dick, /daily та /masturbation можна використовувати без очікування кулдауну.' if enabled else 'Звичайні кулдауни знову працюють.'}",
+        discord.Color.green() if enabled else discord.Color.red()))
+    await interaction.response.send_message(
+        f"🔋 Для {user.mention} безлімітну стаміну **{('увімкнено ♾️' if enabled else 'вимкнено 🔒')}**.",
+        ephemeral=True)
+
 
 @bot.tree.command(name="block_bank", description="🔒 Заблокувати банківські кредити")
 @app_commands.default_permissions(administrator=True)
