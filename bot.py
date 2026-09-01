@@ -2,6 +2,7 @@ import os
 import random
 import sqlite3
 import asyncio
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -24,6 +25,11 @@ PURCHASE_LOG_CHANNEL_ID = 1543243790943391764
 SYSTEM_LOG_CHANNEL_ID = 1543244165805117600
 ADMIN_LOG_CHANNEL_ID = 1543248471102984222
 MAX_LOAN_DAYS = 10
+IDI_COOLDOWN_SECONDS = 30
+IDI_REWARD_MIN = 500
+IDI_REWARD_MAX = 5000
+_idi_cooldowns: dict[int, float] = {}
+_idi_cooldown_lock = asyncio.Lock()
 
 # Discord CDN emoji links used by the server's embeds.
 EMOJI_DICK = "https://discord.com/assets/d59af318cacdcf3b.svg"
@@ -865,6 +871,48 @@ async def dick(interaction: discord.Interaction):
         discord.Color.green() if change >= 0 else discord.Color.red(),
     ))
 
+
+# ---------------- IDI ----------------
+
+@bot.tree.command(name="idi", description="Послати іншого гравця нахуй та отримати гроші")
+@app_commands.describe(user="Кого послати нахуй")
+async def idi(interaction: discord.Interaction, user: discord.Member):
+    """Public joke/economy command with a 30-second cooldown per user."""
+    if not normal_channel_only(interaction):
+        return await reject_wrong_channel(interaction)
+
+    if user.bot or user.id == interaction.user.id:
+        return await interaction.response.send_message(
+            "❌ Обери іншого користувача. Себе або бота посилати не можна 😄",
+            ephemeral=True,
+        )
+
+    now = time.monotonic()
+    async with _idi_cooldown_lock:
+        last_used = _idi_cooldowns.get(interaction.user.id, 0.0)
+        remaining = IDI_COOLDOWN_SECONDS - (now - last_used)
+        if remaining > 0:
+            return await interaction.response.send_message(
+                f"⏳ Не так швидко! Повторно `/idi` можна використати через **{remaining:.1f} сек.**",
+                ephemeral=True,
+            )
+        _idi_cooldowns[interaction.user.id] = now
+
+    reward = random.randint(IDI_REWARD_MIN, IDI_REWARD_MAX)
+    if not money_add(interaction.user.id, reward):
+        # This should not normally happen, but don't consume the cooldown if
+        # the economy update fails.
+        async with _idi_cooldown_lock:
+            _idi_cooldowns.pop(interaction.user.id, None)
+        return await interaction.response.send_message(
+            "❌ Не вдалося зарахувати нагороду. Спробуй ще раз.",
+            ephemeral=True,
+        )
+
+    await interaction.response.send_message(
+        f"🖕 {interaction.user.mention} послав(ла) нахуй {user.mention} "
+        f"і отримав(ла) **{money(reward)} грн.** 💰"
+    )
 
 # ---------------- PROFILE / MONEY ----------------
 
@@ -4581,6 +4629,35 @@ async def promo_create(interaction: discord.Interaction, code: str, money_amount
     conn.close()
     await log_admin_action(interaction, f"Створив промокод **{code}**: +**{money(money_amount)} грн**, {dick_amount:+d} см.")
     await interaction.response.send_message(f"Промокод {code} створено. +{money(money_amount)}, {dick_amount:+d} см.", ephemeral=True)
+
+# ---------------- SLASH COMMAND ERROR HANDLER ----------------
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    """Prevent silent slash-command failures and always return a useful response."""
+    original = getattr(error, "original", error)
+
+    # Validation errors are normally handled by Discord before callback execution.
+    # For unexpected runtime errors, log the full exception and give the user a
+    # short, non-sensitive message instead of leaving the interaction hanging.
+    print(
+        f"[SLASH ERROR] command={getattr(interaction.command, 'qualified_name', 'unknown')} "
+        f"user={getattr(interaction.user, 'id', 'unknown')}: {original!r}"
+    )
+
+    message = "❌ Під час виконання команди сталася помилка. Спробуй ще раз."
+    if isinstance(error, app_commands.CheckFailure):
+        message = "❌ У тебе немає доступу до цієї команди."
+    elif isinstance(error, app_commands.CommandOnCooldown):
+        message = "⏳ Цю команду зараз не можна використати. Спробуй трохи пізніше."
+
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except discord.HTTPException as exc:
+        print(f"[SLASH ERROR RESPONSE FAILED] {exc!r}")
 
 # ---------------- START ----------------
 
