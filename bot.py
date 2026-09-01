@@ -25,6 +25,13 @@ PURCHASE_LOG_CHANNEL_ID = 1543243790943391764
 SYSTEM_LOG_CHANNEL_ID = 1543244165805117600
 ADMIN_LOG_CHANNEL_ID = 1543248471102984222
 MAX_LOAN_DAYS = 10
+LEVEL_THRESHOLDS = [20, 40, 60, 80, 100, 120, 150, 200, 250, 300, 350, 450, 550, 650, 800, 1000, 1200, 1400, 1600]
+BUSINESS_TAX_DEFAULT = 5
+PRESIDENT_MAX_WITHDRAW = 1_000_000
+PRESIDENT_WITHDRAW_COOLDOWN = 86400
+PRESIDENT_NEWS_COOLDOWN = 7200
+ELECTION_DURATION = 86400
+ELECTION_INTERVAL = 7 * 86400
 IDI_COOLDOWN_SECONDS = 30
 IDI_REWARD_MIN = 500
 IDI_REWARD_MAX = 5000
@@ -288,6 +295,11 @@ def _migrate_schema(conn):
             "bank_banned": "INTEGER NOT NULL DEFAULT 0",
             "bank_ban_reason": "TEXT",
             "stamina": "INTEGER NOT NULL DEFAULT 0",
+            "level": "INTEGER NOT NULL DEFAULT 1",
+            "successful_commands": "INTEGER NOT NULL DEFAULT 0",
+        },
+        "businesses": {
+            "last_paid_at": "TEXT NOT NULL DEFAULT ''",
         },
         "promos": {"created_at": "TEXT NOT NULL DEFAULT ''"},
         "promo_uses": {"used_at": "TEXT NOT NULL DEFAULT ''"},
@@ -624,10 +636,66 @@ def init_db():
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         ended_at TEXT
     );
+
+    CREATE TABLE IF NOT EXISTS business_payouts (
+        payout_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        business_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        gross_amount INTEGER NOT NULL,
+        tax_amount INTEGER NOT NULL,
+        net_amount INTEGER NOT NULL,
+        paid_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS business_preferences (
+        user_id INTEGER PRIMARY KEY,
+        interval_seconds INTEGER NOT NULL DEFAULT 3600,
+        last_dm_at TEXT,
+        onboarding_sent INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS president_state (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS elections (
+        election_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        started_at TEXT NOT NULL,
+        ends_at TEXT NOT NULL,
+        channel_id INTEGER,
+        message_id INTEGER,
+        status TEXT NOT NULL DEFAULT 'active',
+        winner_id INTEGER
+    );
+
+    CREATE TABLE IF NOT EXISTS election_votes (
+        election_id INTEGER NOT NULL,
+        voter_id INTEGER NOT NULL,
+        candidate_id INTEGER NOT NULL,
+        voted_at TEXT NOT NULL,
+        PRIMARY KEY(election_id, voter_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS president_motions (
+        motion_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        president_id INTEGER NOT NULL,
+        started_at TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'active'
+    );
+
+    CREATE TABLE IF NOT EXISTS president_motion_votes (
+        motion_id INTEGER NOT NULL,
+        voter_id INTEGER NOT NULL,
+        voted_at TEXT NOT NULL,
+        PRIMARY KEY(motion_id, voter_id)
+    );
     """)
     _migrate_schema(conn)
     # Move legacy case inventory into the unified /inventory storage once.
     conn.execute("""INSERT INTO inventory_items(user_id, item_type, item_key, quantity)\n                       SELECT user_id, 'case', rarity, quantity FROM case_inventory WHERE quantity > 0\n                       ON CONFLICT(user_id, item_type, item_key) DO UPDATE SET quantity=MAX(inventory_items.quantity, excluded.quantity)""")
+    conn.execute("INSERT OR IGNORE INTO president_state(key,value) VALUES ('treasury','10000000')")
+    conn.execute("INSERT OR IGNORE INTO president_state(key,value) VALUES ('business_tax','5')")
     conn.commit()
     conn.close()
     _db_initialized = True
@@ -898,7 +966,7 @@ async def idi(interaction: discord.Interaction, user: discord.Member):
             )
         _idi_cooldowns[interaction.user.id] = now
 
-    reward = random.randint(IDI_REWARD_MIN, IDI_REWARD_MAX)
+    reward = random.randint(IDI_REWARD_MIN, IDI_REWARD_MAX) * level_multiplier(int(get_user(interaction.user.id)["level"] or 1))
     if not money_add(interaction.user.id, reward):
         # This should not normally happen, but don't consume the cooldown if
         # the economy update fails.
@@ -909,10 +977,52 @@ async def idi(interaction: discord.Interaction, user: discord.Member):
             ephemeral=True,
         )
 
+    register_successful_command(interaction.user.id)
     await interaction.response.send_message(
         f"🖕 {interaction.user.mention} послав(ла) нахуй {user.mention} "
         f"і отримав(ла) **{money(reward)} грн.** 💰"
     )
+
+
+# ---------------- LEVELS ----------------
+def level_multiplier(level: int) -> int:
+    return 2 ** max(0, int(level) - 1)
+
+def register_successful_command(user_id: int, amount: int = 1):
+    """Count only a completed, successful economy/action event."""
+    if amount <= 0 or is_admin(user_id):
+        return
+    ensure_user(user_id)
+    conn = db()
+    row = conn.execute("SELECT successful_commands, level FROM users WHERE user_id=?", (user_id,)).fetchone()
+    total = int(row["successful_commands"] or 0) + amount
+    level = 1
+    for threshold in LEVEL_THRESHOLDS:
+        if total >= threshold:
+            level += 1
+        else:
+            break
+    old_level = int(row["level"] or 1)
+    conn.execute("UPDATE users SET successful_commands=?, level=? WHERE user_id=?", (total, level, user_id))
+    conn.commit(); conn.close()
+    if level > old_level:
+        try:
+            asyncio.get_event_loop().create_task(safe_dm(user_id, embed_obj=embed(
+                "🎉 Новий рівень!",
+                f"Ти досяг **{level} рівня**!\n\n✨ Постійний множник бонусів: **x{level_multiplier(level)}**.",
+                discord.Color.gold()
+            )))
+        except RuntimeError:
+            pass
+
+def get_level_info(user_id: int):
+    u = get_user(user_id)
+    level = int(u["level"] or 1)
+    total = int(u["successful_commands"] or 0)
+    if level >= 20:
+        return level, total, None
+    next_threshold = LEVEL_THRESHOLDS[level - 1]
+    return level, total, next_threshold
 
 # ---------------- PROFILE / MONEY ----------------
 
@@ -931,6 +1041,9 @@ async def profile(interaction: discord.Interaction, user: discord.Member | None 
     e.add_field(name="🏢 Бізнес", value=f"**{u['active_business'] or 'немає'}**", inline=True)
     e.add_field(name="🏠 Дім", value=f"**{u['primary_house'] or 'немає'}**", inline=True)
     e.add_field(name="🚘 Гараж", value=f"**{u['garage_type'] or 'немає'}**", inline=True)
+    level, total, next_threshold = get_level_info(interaction.user.id if user is None else user.id)
+    progress = f"{total}/{next_threshold}" if next_threshold else f"{total} (максимум)"
+    e.add_field(name="⭐ Рівень", value=f"**{level}** • успішних команд: **{progress}** • бонуси: **x{level_multiplier(level)}**", inline=False)
     await interaction.response.send_message(embed=e)
 
 
@@ -970,6 +1083,7 @@ async def pay(interaction: discord.Interaction, member: discord.Member, amount: 
     if not changed:
         await interaction.response.send_message("❌ Не вдалося виконати переказ. Спробуй ще раз.", ephemeral=True)
         return
+    register_successful_command(interaction.user.id)
     await interaction.response.send_message(embed=embed(
         "💸 Переказ виконано",
         f"{interaction.user.mention} відправив {member.mention} **{money(amount)}** 💰."
@@ -989,11 +1103,13 @@ async def daily(interaction: discord.Interaction):
             f"⏳ Наступний бонус буде доступний через **{fmt_duration(left)}**.", ephemeral=True
         )
         return
-    money_add(interaction.user.id, DAILY_REWARD)
+    reward = DAILY_REWARD * level_multiplier(int(u["level"] or 1))
+    money_add(interaction.user.id, reward)
+    register_successful_command(interaction.user.id)
     set_cooldown(interaction.user.id, "daily_at")
     await interaction.response.send_message(embed=embed(
          "🎁 Щоденний бонус",
-        f"[🎁]({EMOJI_GIFT}) Ти отримав `{money(DAILY_REWARD)}` [💰]({EMOJI_MONEY})!",
+        f"[🎁]({EMOJI_GIFT}) Ти отримав `{money(reward)}` [💰]({EMOJI_MONEY})!",
         discord.Color.gold()
     ))
 
@@ -1050,6 +1166,8 @@ class PromoModal(discord.ui.Modal, title="Активація промокоду"
         conn.execute("INSERT INTO promo_uses(code, user_id) VALUES (?, ?)", (code, interaction.user.id))
         conn.execute("UPDATE users SET balance=balance+?, dick_size=dick_size+? WHERE user_id=?", (promo["money"], promo["dick"], interaction.user.id))
         conn.commit(); conn.close()
+        if promo["money"] > 0:
+            register_successful_command(interaction.user.id)
         await interaction.response.send_message(
             f"✅ Промокод **{code}** активовано!\n💰 +**{money(promo['money'])}**\n🍆 {promo['dick']:+d} см", ephemeral=True
         )
@@ -1134,6 +1252,7 @@ class CoinChoiceView(discord.ui.View):
                 color = discord.Color.red()
 
             # The result is public so everyone in the channel can see it.
+            register_successful_command(self.owner_id)
             await interaction.channel.send(
                 embed=embed(title, text, color)
             )
@@ -1461,6 +1580,8 @@ async def finish_cookie_game(game: dict):
     else:
         money_add(a, bet); money_add(b, bet)
         result = f"🤝 **Нічия!**\n\n<@{a}> — **{sa}** очок\n<@{b}> — **{sb}** очок\n\n💰 Ставки повернуто обом гравцям."
+    register_successful_command(a)
+    register_successful_command(b)
     conn = db(); conn.execute("UPDATE cookie_games SET status='finished', proposer_score=?, opponent_score=?, ended_at=? WHERE channel_id=?", (sa, sb, datetime.now(timezone.utc).isoformat(), game["channel_id"])); conn.commit(); conn.close()
     await channel.send(embed=embed("🍪 Результат гри", result, discord.Color.green() if sa != sb else discord.Color.blurple()))
     await asyncio.sleep(15)
@@ -2973,6 +3094,9 @@ async def process_number_guess(channel_id, user_id, guess, channel):
     finally:
         conn.close()
     if won:
+        register_successful_command(user_id)
+        other_id = row["opponent_id"] if user_id == row["proposer_id"] else row["proposer_id"]
+        register_successful_command(other_id)
         await channel.send(embed=embed("🏆 Перемога!", f"🎯 <@{user_id}> вгадав число суперника!\n\n🔢 Загадане число: **{target}**\n💰 Переможець отримує **{money(winnings)}** 💰 (**X2** від ставки **{money(row['bet'])}**).", discord.Color.green()))
         asyncio.create_task(delete_number_channel_later(channel, channel_id))
         return f"🎉 Ти вгадав! Ти отримуєш **{money(winnings)}** 💰."
@@ -3040,17 +3164,19 @@ async def finish_masturbation_session(session_id: int):
     try:
         row=conn.execute("SELECT * FROM masturbation_sessions WHERE session_id=? AND status='running'",(session_id,)).fetchone()
         if not row: return
-        conn.execute("UPDATE users SET balance=balance+? WHERE user_id=?",(row["reward"],row["user_id"]))
+        reward = int(row["reward"]) * level_multiplier(int(get_user(row["user_id"])["level"] or 1))
+        conn.execute("UPDATE users SET balance=balance+? WHERE user_id=?",(reward,row["user_id"]))
         conn.execute("UPDATE masturbation_sessions SET status='finished', finished_at=? WHERE session_id=?",
                      (datetime.now(timezone.utc).isoformat(),session_id))
         conn.commit()
+        register_successful_command(row["user_id"])
         # Completion is public in the same channel where /masturbation was started.
         channel = bot.get_channel(row["channel_id"]) if row["channel_id"] else None
         if channel:
             try:
                 await channel.send(embed=embed(
                     "💰 Активність завершена!",
-                    f"<@{row['user_id']}> завершив активність та отримав бонус **{money(row['reward'])}** 💰.",
+                    f"<@{row['user_id']}> завершив активність та отримав бонус **{money(reward)}** 💰.",
                     discord.Color.green()
                 ))
             except discord.HTTPException:
@@ -3488,18 +3614,32 @@ async def pay_businesses():
         hours = int((now - last).total_seconds() // 3600)
         if hours <= 0:
             continue
-        amount = hours * b["hourly_profit"]
-        money_add(b["user_id"], amount)
+        gross = hours * int(b["hourly_profit"])
+        tax_percent = max(0, min(15, int(get_state("business_tax", BUSINESS_TAX_DEFAULT))))
+        tax = gross * tax_percent // 100
+        net = gross - tax
+        if net > 0:
+            money_add(b["user_id"], net)
+        if tax:
+            add_treasury(tax)
         new_last = last + timedelta(hours=hours)
         conn = db()
         conn.execute("UPDATE businesses SET last_paid_at=? WHERE business_id=?", (new_last.isoformat(), b["business_id"]))
+        conn.execute("INSERT INTO business_payouts(business_id,user_id,gross_amount,tax_amount,net_amount,paid_at) VALUES(?,?,?,?,?,?)",
+                     (b["business_id"], b["user_id"], gross, tax, net, now.isoformat()))
         conn.commit(); conn.close()
-        await safe_dm(b["user_id"], embed_obj=embed(
-            "🏢 Прибуток бізнесу",
-            f"Твій бізнес **{b['business_name']}** приніс тобі **{money(amount)} грн.** за **{hours} год.**\n\n"
-            f"💰 Тепер твій бюджет складає: **{money(get_user(b['user_id'])['balance'])} грн.**",
-            discord.Color.green()
-        ))
+        await maybe_send_business_profit_dm(b["user_id"], b["business_name"], gross, tax, net, hours)
+
+async def process_political_state():
+    now=datetime.now(timezone.utc)
+    scheduled=get_state("election_scheduled")
+    if scheduled and parse_time(scheduled) and parse_time(scheduled)<=now:
+        set_state("election_scheduled","")
+        await start_election("scheduled")
+    conn=db(); active=conn.execute("SELECT election_id,ends_at FROM elections WHERE status='active' ORDER BY election_id DESC LIMIT 1").fetchone(); conn.close()
+    if active and parse_time(active["ends_at"])<=now: await finish_election(active["election_id"])
+    last=parse_time(get_state("last_election_finished"))
+    if not active and (not last or (now-last).total_seconds()>=ELECTION_INTERVAL): await start_election("weekly")
 
 async def economy_loop():
     await asyncio.sleep(10)
@@ -3508,6 +3648,7 @@ async def economy_loop():
             await pay_businesses()
             await process_garages()
             await process_loans()
+            await process_political_state()
         except Exception as exc:
             print(f"[ECONOMY] loop error: {exc!r}")
         await asyncio.sleep(GARAGE_CHECK_INTERVAL)
@@ -3564,7 +3705,294 @@ class BusinessView(discord.ui.View):
         else:
             msg += "ℹ️ **Активний бізнес можна мати лише один.** Цей бізнес додано в `/inventory`; там його можна зробити активним замість поточного."
         await interaction.response.send_message(embed=embed("🏢 Бізнес придбано",msg,discord.Color.green()), ephemeral=True)
+        await send_business_preference(interaction.user.id, force=True)
         asyncio.create_task(log_purchase(f"Гравець **{interaction.user}** (<@{interaction.user.id}>) купив бізнес **{name}** за **{money(price)} грн.**. Прибуток: **+{money(hourly)} грн./год.**"))
+
+
+# ---------------- BUSINESS STATS / NOTIFICATIONS ----------------
+BUSINESS_NOTIFICATION_OPTIONS = [("1 год.",3600),("2 год.",7200),("5 год.",18000),("1 день",86400),("Ніколи",0)]
+
+def get_state(key, default=None):
+    conn=db(); row=conn.execute("SELECT value FROM president_state WHERE key=?",(key,)).fetchone(); conn.close()
+    return row["value"] if row else default
+
+def set_state(key,value):
+    conn=db(); conn.execute("INSERT INTO president_state(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(key,str(value))); conn.commit(); conn.close()
+
+def get_treasury(): return int(get_state("treasury",10000000))
+
+def add_treasury(amount):
+    if amount <= 0: return True
+    conn=db(); conn.execute("UPDATE president_state SET value=CAST(value AS INTEGER)+? WHERE key='treasury'",(int(amount),)); conn.commit(); conn.close(); return True
+
+def remove_treasury(amount):
+    if amount <= 0: return True
+    conn=db(); cur=conn.execute("UPDATE president_state SET value=CAST(value AS INTEGER)-? WHERE key='treasury' AND CAST(value AS INTEGER)>=?",(int(amount),int(amount))); ok=cur.rowcount==1; conn.commit(); conn.close(); return ok
+
+def business_stats(user_id):
+    conn=db()
+    businesses=conn.execute("SELECT * FROM businesses WHERE user_id=? ORDER BY business_id",(user_id,)).fetchall()
+    since=datetime.now(timezone.utc).replace(hour=0,minute=0,second=0,microsecond=0).isoformat()
+    rows=[]
+    for b in businesses:
+        today=conn.execute("SELECT COALESCE(SUM(net_amount),0) x FROM business_payouts WHERE business_id=? AND paid_at>=?",(b["business_id"],since)).fetchone()["x"]
+        total=conn.execute("SELECT COALESCE(SUM(net_amount),0) x FROM business_payouts WHERE business_id=?",(b["business_id"],)).fetchone()["x"]
+        rows.append((b,int(b["hourly_profit"]),int(today),int(total)))
+    conn.close(); return rows
+
+def business_embed(user_id):
+    rows=business_stats(user_id)
+    if not rows:
+        return embed("🏢 Бізнес", "У тебе ще немає бізнесу. Придбати його можна через `/business`.", discord.Color.red())
+    lines=[]
+    for b,h,today,total in rows:
+        active=" 🟢" if get_user(user_id)["active_business"]==b["business_name"] else ""
+        lines.append(f"### 🏢 {b['business_name']}{active}\n💵 Прибуток: **{money(h)} грн/год.**\n📅 Сьогодні: **{money(today)} грн.**\n📈 За весь час: **{money(total)} грн.**")
+    tax=int(get_state("business_tax",5))
+    return embed("📊 Статистика бізнесу", "\n\n".join(lines)+f"\n\n🏛️ До казни зараз йде **{tax}%** прибутку бізнесів.", discord.Color.gold())
+
+async def send_business_preference(user_id, force=False):
+    conn=db(); row=conn.execute("SELECT * FROM business_preferences WHERE user_id=?",(user_id,)).fetchone()
+    if row and row["onboarding_sent"] and not force:
+        conn.close(); return
+    conn.execute("INSERT INTO business_preferences(user_id,interval_seconds,onboarding_sent) VALUES(?,?,1) ON CONFLICT(user_id) DO UPDATE SET onboarding_sent=1",(user_id,3600))
+    conn.commit(); conn.close()
+    await safe_dm(user_id, content="🏢 У тебе є бізнес! Обери, як часто повідомляти про прибуток:", view=BusinessPreferenceView(user_id))
+
+async def maybe_send_business_profit_dm(user_id,business_name,gross,tax,net,hours):
+    conn=db(); row=conn.execute("SELECT * FROM business_preferences WHERE user_id=?",(user_id,)).fetchone()
+    if not row:
+        conn.execute("INSERT INTO business_preferences(user_id,interval_seconds,onboarding_sent) VALUES(?,?,1)",(user_id,3600)); conn.commit(); row=conn.execute("SELECT * FROM business_preferences WHERE user_id=?",(user_id,)).fetchone()
+    interval=int(row["interval_seconds"] or 0); last=parse_time(row["last_dm_at"]); now=datetime.now(timezone.utc)
+    should=interval>0 and (not last or (now-last).total_seconds()>=interval)
+    if should:
+        conn.execute("UPDATE business_preferences SET last_dm_at=? WHERE user_id=?",(now.isoformat(),user_id)); conn.commit()
+    conn.close()
+    if should:
+        await safe_dm(user_id,embed_obj=embed("🏢 Прибуток бізнесу",f"**{business_name}** приніс **{money(gross)} грн.** за {hours} год.\n\n🏛️ У казну: **{money(tax)} грн.**\n💰 Тобі: **{money(net)} грн.**",discord.Color.green()))
+
+class BusinessPreferenceView(discord.ui.View):
+    def __init__(self, owner_id): super().__init__(timeout=86400); self.owner_id=owner_id
+    async def interaction_check(self,interaction):
+        if interaction.user.id!=self.owner_id: await interaction.response.send_message("❌ Це меню належить іншому гравцю.",ephemeral=True); return False
+        return True
+    async def choose(self,interaction,seconds,label):
+        conn=db(); conn.execute("INSERT INTO business_preferences(user_id,interval_seconds,onboarding_sent) VALUES(?,?,1) ON CONFLICT(user_id) DO UPDATE SET interval_seconds=?,onboarding_sent=1",(self.owner_id,seconds,seconds)); conn.commit(); conn.close()
+        await interaction.response.edit_message(content=f"✅ Повідомлення про прибуток: **{label}**.",view=None)
+    @discord.ui.button(label="Раз в 1 год.",style=discord.ButtonStyle.primary)
+    async def h1(self,i,b): await self.choose(i,3600,"раз в 1 годину")
+    @discord.ui.button(label="Раз в 2 год.",style=discord.ButtonStyle.primary)
+    async def h2(self,i,b): await self.choose(i,7200,"раз в 2 години")
+    @discord.ui.button(label="Раз в 5 год.",style=discord.ButtonStyle.primary)
+    async def h5(self,i,b): await self.choose(i,18000,"раз в 5 годин")
+    @discord.ui.button(label="Раз в день",style=discord.ButtonStyle.primary)
+    async def day(self,i,b): await self.choose(i,86400,"раз в день")
+    @discord.ui.button(label="Ніколи",style=discord.ButtonStyle.secondary)
+    async def never(self,i,b): await self.choose(i,0,"ніколи")
+
+class BizShareModal(discord.ui.Modal,title="Поділитися бізнесом"):
+    user_id=discord.ui.TextInput(label="Discord ID гравця",placeholder="123456789012345678")
+    async def on_submit(self,interaction):
+        try: uid=int(str(self.user_id.value).strip())
+        except ValueError: return await interaction.response.send_message("❌ Невірний Discord ID.",ephemeral=True)
+        target=interaction.guild.get_member(uid) if interaction.guild else bot.get_user(uid)
+        if not target: target=await bot.fetch_user(uid)
+        if not target or target.id==interaction.user.id: return await interaction.response.send_message("❌ Не вдалося знайти іншого гравця.",ephemeral=True)
+        await safe_dm(target.id,embed_obj=embed("📊 Статистика бізнесу",f"<@{interaction.user.id}> поділився з вами статистикою свого бізнеса.",discord.Color.blurple()))
+        await safe_dm(target.id,embed_obj=business_embed(interaction.user.id))
+        await interaction.response.send_message(f"✅ Статистику надіслано <@{target.id}>.",ephemeral=True)
+
+class BizView(discord.ui.View):
+    def __init__(self,owner_id): super().__init__(timeout=300); self.owner_id=owner_id
+    async def interaction_check(self,interaction):
+        if interaction.user.id!=self.owner_id: await interaction.response.send_message("❌ Це меню належить іншому гравцю.",ephemeral=True); return False
+        return True
+    @discord.ui.button(label="Закрити",style=discord.ButtonStyle.secondary)
+    async def close(self,interaction,button): await interaction.response.edit_message(content="📊 Статистику закрито.",embed=None,view=None)
+    @discord.ui.button(label="Поділитися",style=discord.ButtonStyle.success)
+    async def share(self,interaction,button): await interaction.response.send_modal(BizShareModal())
+
+@bot.tree.command(name="biz",description="Статистика твого бізнесу")
+async def biz(interaction: discord.Interaction):
+    await interaction.response.send_message(embed=business_embed(interaction.user.id),view=BizView(interaction.user.id),ephemeral=True)
+
+# ---------------- TREASURY / PRESIDENT ----------------
+class AmountModal(discord.ui.Modal,title="Сума"):
+    amount=discord.ui.TextInput(label="Сума",placeholder="100000")
+    def __init__(self,mode): super().__init__(); self.mode=mode
+    async def on_submit(self,interaction):
+        try: amount=int(str(self.amount.value).replace(" ","").replace(",","")); assert amount>0
+        except (ValueError,AssertionError): return await interaction.response.send_message("❌ Невірна сума.",ephemeral=True)
+        if self.mode=="deposit":
+            if not money_add(interaction.user.id,-amount): return await interaction.response.send_message("❌ Недостатньо грошей.",ephemeral=True)
+            add_treasury(amount); await interaction.response.send_message(f"✅ Ти вклав **{money(amount)} грн.** у казну.",ephemeral=True)
+        elif self.mode=="withdraw":
+            if not remove_treasury(amount): return await interaction.response.send_message("❌ У казні недостатньо грошей.",ephemeral=True)
+            money_add(interaction.user.id,amount); await interaction.response.send_message(f"✅ Отримано з казни **{money(amount)} грн.**.",ephemeral=True)
+
+@bot.tree.command(name="kazna",description="Казна сервера та внесення грошей")
+async def kazna(interaction):
+    class V(discord.ui.View):
+        def __init__(self): super().__init__(timeout=300)
+        @discord.ui.button(label="Вкласти гроші",style=discord.ButtonStyle.success)
+        async def dep(self,i,b): await i.response.send_modal(AmountModal("deposit"))
+    await interaction.response.send_message(embed=embed("🏛️ Казна",f"У казні: **{money(get_treasury())} грн.**\nПодаток з бізнесів: **{int(get_state('business_tax',5))}%**.",discord.Color.gold()),view=V(),ephemeral=True)
+
+def current_president():
+    value=get_state("president")
+    return int(value) if value and value.isdigit() else None
+
+async def start_election(reason="weekly"):
+    conn=db(); active=conn.execute("SELECT * FROM elections WHERE status='active' AND ends_at>?",(datetime.now(timezone.utc).isoformat(),)).fetchone()
+    if active: conn.close(); return
+    now=datetime.now(timezone.utc); end=now+timedelta(seconds=ELECTION_DURATION)
+    cur=conn.execute("INSERT INTO elections(started_at,ends_at,channel_id,status) VALUES(?,?,?, 'active')",(now.isoformat(),end.isoformat(),NORMAL_CHANNEL_ID)); eid=cur.lastrowid
+    conn.commit(); conn.close()
+    guild=bot.get_guild(GUILD_ID) if GUILD_ID else None
+    if guild:
+        ch=guild.get_channel(NORMAL_CHANNEL_ID)
+        if ch:
+            view=ElectionView(eid)
+            msg=await ch.send(embed=embed("🇺🇦 Вибори президента", "Протягом **24 годин** обери кандидата кнопкою нижче. За себе голосувати не можна.",discord.Color.gold()),view=view)
+            conn=db(); conn.execute("UPDATE elections SET message_id=? WHERE election_id=?",(msg.id,eid)); conn.commit(); conn.close()
+        for m in guild.members:
+            if not m.bot: await safe_dm(m.id,content="🇺🇦 На сервері розпочалися вибори президента. Обрати кандидата можна у каналі сервера.")
+
+class ElectionView(discord.ui.View):
+    def __init__(self,election_id): super().__init__(timeout=ELECTION_DURATION); self.election_id=election_id
+    @discord.ui.button(label="Проголосувати",emoji="🗳️",style=discord.ButtonStyle.primary)
+    async def vote(self,interaction,button):
+        if not interaction.guild: return await interaction.response.send_message("❌ Голосувати можна лише на сервері.",ephemeral=True)
+        conn=db(); e=conn.execute("SELECT * FROM elections WHERE election_id=? AND status='active'",(self.election_id,)).fetchone(); conn.close()
+        if not e: return await interaction.response.send_message("❌ Вибори вже завершені.",ephemeral=True)
+        select=discord.ui.UserSelect(placeholder="Оберіть кандидата",min_values=1,max_values=1)
+        class V(discord.ui.View):
+            def __init__(self): super().__init__(timeout=120); self.add_item(select)
+        v=V()
+        async def cb(i):
+            cand=select.values[0]
+            if cand.bot: return await i.response.send_message("❌ За ботів голосувати не можна.",ephemeral=True)
+            if cand.id==i.user.id: return await i.response.send_message("❌ За себе голосувати не можна.",ephemeral=True)
+            conn=db(); conn.execute("INSERT OR REPLACE INTO election_votes(election_id,voter_id,candidate_id,voted_at) VALUES(?,?,?,?)",(self.election_id,i.user.id,cand.id,datetime.now(timezone.utc).isoformat())); conn.commit(); conn.close()
+            await i.response.edit_message(content=f"✅ Твій голос віддано за {cand.mention}.",view=None)
+        select.callback=cb
+        await interaction.response.send_message("Обери кандидата:",view=v,ephemeral=True)
+
+async def finish_election(election_id):
+    conn=db(); e=conn.execute("SELECT * FROM elections WHERE election_id=? AND status='active'",(election_id,)).fetchone()
+    if not e: conn.close(); return
+    now=datetime.now(timezone.utc)
+    if parse_time(e["ends_at"])>now: conn.close(); return
+    winner=conn.execute("SELECT candidate_id,COUNT(*) c FROM election_votes WHERE election_id=? GROUP BY candidate_id ORDER BY c DESC,candidate_id ASC LIMIT 1",(election_id,)).fetchone()
+    set_state("last_election_finished",now.isoformat())
+    if winner:
+        set_state("president",str(winner["candidate_id"]))
+        set_state("president_started",now.isoformat())
+    conn.execute("UPDATE elections SET status='finished',winner_id=? WHERE election_id=?",(winner["candidate_id"] if winner else None,election_id)); conn.commit(); conn.close()
+    if winner:
+        await safe_dm(winner["candidate_id"],content="🇺🇦 Вітаємо! Ви стали президентом сервера.")
+        guild=bot.get_guild(GUILD_ID) if GUILD_ID else None
+        if guild:
+            for m in guild.members:
+                if not m.bot and m.id!=winner["candidate_id"]: await safe_dm(m.id,content=f"🇺🇦 Президентом сервера став <@{winner['candidate_id']}>.")
+
+@bot.tree.command(name="prezident_vuboru",description="🔒 Запустити вибори президента через вказаний час (години)")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(time="Через скільки годин розпочати вибори")
+async def prezident_vuboru(interaction,time:app_commands.Range[int,0,168]):
+    if not is_admin(interaction.user.id): return await admin_denied(interaction)
+    if time==0: await start_election("admin"); return await interaction.response.send_message("✅ Вибори запущено.",ephemeral=True)
+    set_state("election_scheduled",(datetime.now(timezone.utc)+timedelta(hours=time)).isoformat())
+    await interaction.response.send_message(f"✅ Вибори заплановано через **{time} год.**",ephemeral=True)
+
+class UkraineView(discord.ui.View):
+    def __init__(self,owner_id): super().__init__(timeout=600); self.owner_id=owner_id
+    async def interaction_check(self,i):
+        if i.user.id!=self.owner_id: await i.response.send_message("❌ Меню президента доступне лише президенту.",ephemeral=True); return False
+        return True
+    @discord.ui.button(label="Взяти з казни",style=discord.ButtonStyle.danger)
+    async def take(self,i,b): await i.response.send_modal(AmountModal("withdraw"))
+    @discord.ui.button(label="Покласти в казну",style=discord.ButtonStyle.success)
+    async def put(self,i,b): await i.response.send_modal(AmountModal("deposit"))
+    @discord.ui.button(label="Видати всім",style=discord.ButtonStyle.primary)
+    async def give(self,i,b): await i.response.send_modal(PresidentGiveAllModal())
+    @discord.ui.button(label="Новина жителям",style=discord.ButtonStyle.primary)
+    async def news(self,i,b): await i.response.send_modal(PresidentNewsModal())
+    @discord.ui.button(label="Змінити податок",style=discord.ButtonStyle.secondary)
+    async def tax(self,i,b): await i.response.send_modal(PresidentTaxModal())
+
+class PresidentGiveAllModal(discord.ui.Modal,title="Видати всім"):
+    amount=discord.ui.TextInput(label="Сума кожному",placeholder="10000")
+    async def on_submit(self,i):
+        try: amount=int(str(self.amount.value)); assert amount>0
+        except (ValueError,AssertionError): return await i.response.send_message("❌ Невірна сума.",ephemeral=True)
+        guild=i.guild; users=[m for m in guild.members if not m.bot]
+        total=amount*len(users)
+        if not remove_treasury(total): return await i.response.send_message(f"❌ У казні недостатньо. Потрібно {money(total)} грн.",ephemeral=True)
+        for m in users: money_add(m.id,amount)
+        await i.response.send_message(f"✅ Видано **{money(amount)} грн.** кожному з {len(users)} жителів.",ephemeral=True)
+
+class PresidentNewsModal(discord.ui.Modal,title="Новина президента"):
+    text=discord.ui.TextInput(label="Текст",style=discord.TextStyle.paragraph,max_length=2000)
+    async def on_submit(self,i):
+        last=parse_time(get_state("president_news_at")); now=datetime.now(timezone.utc)
+        if last and (now-last).total_seconds()<PRESIDENT_NEWS_COOLDOWN: return await i.response.send_message("⏳ Новину можна оголошувати раз на 2 години.",ephemeral=True)
+        set_state("president_news_at",now.isoformat())
+        for m in i.guild.members:
+            if not m.bot and m.id!=i.user.id: await safe_dm(m.id,content=f"🇺🇦 **Новина від президента <@{i.user.id}>**\n\n{self.text.value}")
+        await i.response.send_message("✅ Новину надіслано жителям у ЛС.",ephemeral=True)
+
+class PresidentTaxModal(discord.ui.Modal,title="Податок бізнесу"):
+    percent=discord.ui.TextInput(label="Відсоток 0-15",placeholder="5")
+    async def on_submit(self,i):
+        try: p=int(str(self.percent.value)); assert 0<=p<=15
+        except (ValueError,AssertionError): return await i.response.send_message("❌ Вкажи число від 0 до 15.",ephemeral=True)
+        set_state("business_tax",p); await i.response.send_message(f"✅ Податок бізнесів встановлено: **{p}%**.",ephemeral=True)
+
+@bot.tree.command(name="ukraine",description="Меню керування країною президента")
+async def ukraine(interaction):
+    if current_president()!=interaction.user.id: return await interaction.response.send_message("❌ Ти не президент.",ephemeral=True)
+    await interaction.response.send_message(embed=embed("🇺🇦 Україна",f"Президент: <@{interaction.user.id}>\n🏛️ Казна: **{money(get_treasury())} грн.**\n📊 Податок бізнесу: **{int(get_state('business_tax',5))}%**",discord.Color.gold()),view=UkraineView(interaction.user.id),ephemeral=True)
+
+@bot.tree.command(name="robbery",description="50/50 пограбувати іншого гравця")
+@app_commands.describe(user="Кого пограбувати")
+async def robbery(interaction,user:discord.Member):
+    if not normal_channel_only(interaction): return await reject_wrong_channel(interaction)
+    if user.bot or user.id==interaction.user.id: return await interaction.response.send_message("❌ Обери іншого гравця.",ephemeral=True)
+    victim=get_user(user.id); robber=get_user(interaction.user.id)
+    if random.random()<0.5:
+        amount=int(victim["balance"])
+        if amount>0:
+            money_add(user.id,-amount); money_add(interaction.user.id,amount)
+        register_successful_command(interaction.user.id)
+        await interaction.response.send_message(f"💰 {interaction.user.mention} повністю пограбував {user.mention} і забрав **{money(amount)} грн.**!")
+    else:
+        lost=int(robber["balance"])
+        if lost>0:
+            money_add(interaction.user.id,-lost); add_treasury(lost)
+        register_successful_command(interaction.user.id)
+        await interaction.response.send_message(f"🚨 {interaction.user.mention} не зміг пограбувати {user.mention} і втратив **{money(lost)} грн.** — гроші пішли в казну.")
+
+class MotionView(discord.ui.View):
+    def __init__(self,motion_id): super().__init__(timeout=86400); self.motion_id=motion_id
+    @discord.ui.button(label="За!",style=discord.ButtonStyle.danger)
+    async def yes(self,i,b):
+        if i.user.id==current_president(): return await i.response.send_message("❌ Президент не може голосувати за своє зняття.",ephemeral=True)
+        conn=db(); conn.execute("INSERT OR IGNORE INTO president_motion_votes(motion_id,voter_id,voted_at) VALUES(?,?,?)",(self.motion_id,i.user.id,datetime.now(timezone.utc).isoformat())); count=conn.execute("SELECT COUNT(*) c FROM president_motion_votes WHERE motion_id=?",(self.motion_id,)).fetchone()["c"]; conn.commit(); conn.close()
+        if count>=2:
+            old=current_president(); set_state("president",""); conn=db(); conn.execute("UPDATE president_motions SET status='passed' WHERE motion_id=?",(self.motion_id,)); conn.commit(); conn.close()
+            if old: await safe_dm(old,content="🇺🇦 Вас зняли з посади президента мітингом.")
+            await start_election("motion")
+            return await i.response.edit_message(content="🇺🇦 Мітинг успішний! Президент знятий, розпочалися нові вибори.",view=None)
+        await i.response.send_message(f"✅ Голос зараховано. Потрібно ще **{2-count}** голос(и).",ephemeral=True)
+
+@bot.tree.command(name="mitung",description="Ініціювати мітинг за зняття президента")
+async def mitung(interaction):
+    if not current_president(): return await interaction.response.send_message("❌ Зараз немає президента.",ephemeral=True)
+    conn=db(); active=conn.execute("SELECT * FROM president_motions WHERE status='active' LIMIT 1").fetchone()
+    if active: conn.close(); return await interaction.response.send_message("⚠️ Мітинг уже триває.",ephemeral=True)
+    cur=conn.execute("INSERT INTO president_motions(president_id,started_at) VALUES(?,?)",(current_president(),datetime.now(timezone.utc).isoformat())); mid=cur.lastrowid; conn.commit(); conn.close()
+    await interaction.response.send_message(embed=embed("📢 Мітинг",f"<@{interaction.user.id}> ініціював мітинг за зняття президента <@{current_president()}>. Потрібно **2 голоси «За!»**.",discord.Color.red()),view=MotionView(mid))
 
 @bot.tree.command(name="business", description="Купити бізнес")
 async def business(interaction: discord.Interaction):
@@ -4668,6 +5096,12 @@ async def on_ready():
     global _backup_task, _economy_task
     init_db()
     await resume_masturbation_sessions()
+    try:
+        conn = db(); existing_business_users = {r["user_id"] for r in conn.execute("SELECT DISTINCT user_id FROM businesses").fetchall()}; conn.close()
+        for uid in existing_business_users:
+            await send_business_preference(uid)
+    except Exception as exc:
+        print(f"[BUSINESS DM] startup notification error: {exc!r}")
     if _economy_task is None or _economy_task.done():
         _economy_task = asyncio.create_task(economy_loop())
     if _backup_task is None or _backup_task.done():
@@ -4688,7 +5122,11 @@ async def on_ready():
             guild_obj = discord.Object(id=GUILD_ID)
             bot.tree.copy_global_to(guild=guild_obj)
             synced = await bot.tree.sync(guild=guild_obj)
-            print(f"Logged in as {bot.user}. Synced {len(synced)} commands to guild {GUILD_ID}.")
+            try:
+                global_synced = await bot.tree.sync()
+                print(f"Logged in as {bot.user}. Synced {len(synced)} guild commands and {len(global_synced)} global commands.")
+            except Exception as global_exc:
+                print(f"Global slash command sync warning: {global_exc!r}")
         else:
             synced = await bot.tree.sync()
             print(f"Logged in as {bot.user}. Synced {len(synced)} global commands.")
