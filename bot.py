@@ -236,6 +236,10 @@ DB_PATH = os.path.abspath(os.path.expanduser(os.getenv("DB_PATH", DEFAULT_DB_PAT
 BACKUP_DIR = os.path.abspath(os.path.expanduser(os.getenv("DB_BACKUP_DIR", os.path.join(os.path.dirname(DB_PATH), "backups")).strip()))
 BACKUP_INTERVAL_SECONDS = max(60, int(os.getenv("DB_BACKUP_INTERVAL_SECONDS", "300")))
 MAX_DB_BACKUPS = max(3, int(os.getenv("MAX_DB_BACKUPS", "30")))
+ECONOMY_LOOP_SECONDS = max(15, int(os.getenv("ECONOMY_LOOP_SECONDS", "30")))
+BUSINESS_DM_BATCH_SIZE = max(1, min(25, int(os.getenv("BUSINESS_DM_BATCH_SIZE", "10"))))
+BUSINESS_DM_RETRY_BASE_SECONDS = max(15, int(os.getenv("BUSINESS_DM_RETRY_BASE_SECONDS", "30")))
+BUSINESS_DM_RETRY_MAX_SECONDS = max(300, int(os.getenv("BUSINESS_DM_RETRY_MAX_SECONDS", "3600")))
 
 if IS_RAILWAY and not DB_PATH.startswith("/data/"):
     raise RuntimeError(
@@ -653,6 +657,22 @@ def init_db():
         interval_seconds INTEGER NOT NULL DEFAULT 3600,
         last_dm_at TEXT,
         onboarding_sent INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS business_notifications (
+        notification_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        payout_id INTEGER NOT NULL UNIQUE,
+        user_id INTEGER NOT NULL,
+        business_name TEXT NOT NULL,
+        gross_amount INTEGER NOT NULL,
+        tax_amount INTEGER NOT NULL,
+        net_amount INTEGER NOT NULL,
+        hours INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        sent_at TEXT,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        next_attempt_at TEXT
     );
 
     CREATE TABLE IF NOT EXISTS president_state (
@@ -3303,18 +3323,50 @@ async def log_admin_action(interaction: discord.Interaction, action: str):
     )
     await send_log(ADMIN_LOG_CHANNEL_ID, message, color=discord.Color.dark_red())
 
-async def safe_dm(user_id: int, *, embed_obj=None, content=None, view=None):
+async def safe_dm(user_id: int, *, embed_obj=None, content=None, view=None, retries=3):
+    """Send a DM without blocking the event loop and retry transient failures.
+
+    Returns True only when Discord confirms the message was sent.
+    """
     user = bot.get_user(user_id)
     if user is None:
         try:
             user = await bot.fetch_user(user_id)
-        except discord.HTTPException:
+        except (discord.NotFound, discord.Forbidden):
             return False
-    try:
-        await user.send(content=content, embed=embed_obj, view=view)
-        return True
-    except discord.HTTPException:
-        return False
+        except discord.HTTPException as exc:
+            print(f"[DM] fetch_user failed for {user_id}: {exc!r}")
+            return False
+
+    attempts = max(1, int(retries))
+    for attempt in range(attempts):
+        try:
+            await user.send(content=content, embed=embed_obj, view=view)
+            return True
+        except discord.Forbidden:
+            # User disabled DMs / bot is blocked. Retrying immediately cannot help.
+            print(f"[DM] Forbidden for user {user_id} (DMs closed or bot blocked).")
+            return False
+        except discord.NotFound:
+            # User/channel disappeared.
+            return False
+        except discord.HTTPException as exc:
+            # Discord rate limits and transient 5xx errors are worth retrying.
+            if attempt >= attempts - 1:
+                print(f"[DM] HTTP failure for {user_id}: {exc!r}")
+                return False
+            retry_after = getattr(exc, "retry_after", None)
+            delay = float(retry_after) if retry_after else min(8.0, 1.5 * (2 ** attempt))
+            await asyncio.sleep(max(0.5, delay))
+        except (asyncio.TimeoutError, TimeoutError) as exc:
+            if attempt >= attempts - 1:
+                print(f"[DM] Timeout for {user_id}: {exc!r}")
+                return False
+            await asyncio.sleep(min(8.0, 1.5 * (2 ** attempt)))
+        except Exception as exc:
+            print(f"[DM] Unexpected failure for {user_id}: {exc!r}")
+            return False
+    return False
 
 async def send_garage_offer(user_id: int):
     conn = db()
@@ -3602,34 +3654,230 @@ async def process_garages():
                 conn.execute("UPDATE users SET garage_reminder_at=NULL WHERE user_id=?", (u["user_id"],))
                 conn.commit(); conn.close()
 
-async def pay_businesses():
+def _pay_businesses_sync():
+    """Apply accrued business income atomically.
+
+    All SQLite work stays off the Discord event loop. A payout and its
+    notification queue entry are committed in the same transaction, so a
+    restart cannot lose an earned payout notification.
+    """
     now = datetime.now(timezone.utc)
+    notifications_created = 0
     conn = db()
-    rows = conn.execute("SELECT * FROM businesses ORDER BY business_id").fetchall()
-    conn.close()
-    for b in rows:
-        user = get_user(b["user_id"])
-        if user["active_business"] != b["business_name"]:
-            continue
-        last = parse_time(b["last_paid_at"]) or now
-        hours = int((now - last).total_seconds() // 3600)
-        if hours <= 0:
-            continue
-        gross = hours * int(b["hourly_profit"])
-        tax_percent = max(0, min(15, int(get_state("business_tax", BUSINESS_TAX_DEFAULT))))
-        tax = gross * tax_percent // 100
-        net = gross - tax
-        if net > 0:
-            money_add(b["user_id"], net)
-        if tax:
-            add_treasury(tax)
-        new_last = last + timedelta(hours=hours)
-        conn = db()
-        conn.execute("UPDATE businesses SET last_paid_at=? WHERE business_id=?", (new_last.isoformat(), b["business_id"]))
-        conn.execute("INSERT INTO business_payouts(business_id,user_id,gross_amount,tax_amount,net_amount,paid_at) VALUES(?,?,?,?,?,?)",
-                     (b["business_id"], b["user_id"], gross, tax, net, now.isoformat()))
-        conn.commit(); conn.close()
-        await maybe_send_business_profit_dm(b["user_id"], b["business_name"], gross, tax, net, hours)
+    try:
+        rows = conn.execute("""
+            SELECT b.*, u.active_business
+            FROM businesses b
+            JOIN users u ON u.user_id=b.user_id
+            ORDER BY b.business_id
+        """).fetchall()
+
+        for b in rows:
+            if b["active_business"] != b["business_name"]:
+                continue
+
+            last = parse_time(b["last_paid_at"])
+            if not last:
+                # Old/corrupt timestamps are repaired without inventing profit.
+                conn.execute(
+                    "UPDATE businesses SET last_paid_at=? WHERE business_id=?",
+                    (now.isoformat(), b["business_id"])
+                )
+                continue
+
+            seconds = (now - last).total_seconds()
+            hours = int(seconds // 3600)
+            if hours <= 0:
+                continue
+
+            gross = hours * int(b["hourly_profit"])
+            tax_percent = max(0, min(15, int(get_state("business_tax", BUSINESS_TAX_DEFAULT))))
+            tax = gross * tax_percent // 100
+            net = gross - tax
+            new_last = last + timedelta(hours=hours)
+
+            # One transaction: money + treasury + payout history + last_paid_at
+            # + pending DM are either all saved or none are saved.
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                if net > 0:
+                    cur = conn.execute(
+                        "UPDATE users SET balance=balance+? WHERE user_id=?",
+                        (net, b["user_id"])
+                    )
+                    if cur.rowcount != 1:
+                        raise RuntimeError(f"user {b['user_id']} disappeared during business payout")
+
+                if tax:
+                    cur = conn.execute("""
+                        UPDATE president_state
+                        SET value=CAST(value AS INTEGER)+?
+                        WHERE key='treasury'
+                    """, (tax,))
+                    if cur.rowcount != 1:
+                        raise RuntimeError("treasury state is missing")
+
+                conn.execute(
+                    "UPDATE businesses SET last_paid_at=? WHERE business_id=?",
+                    (new_last.isoformat(), b["business_id"])
+                )
+                cur = conn.execute("""
+                    INSERT INTO business_payouts(
+                        business_id,user_id,gross_amount,tax_amount,net_amount,paid_at
+                    ) VALUES(?,?,?,?,?,?)
+                """, (
+                    b["business_id"], b["user_id"], gross, tax, net, now.isoformat()
+                ))
+                payout_id = cur.lastrowid
+
+                pref = conn.execute(
+                    "SELECT interval_seconds,last_dm_at FROM business_preferences WHERE user_id=?",
+                    (b["user_id"],)
+                ).fetchone()
+                if not pref:
+                    conn.execute("""
+                        INSERT INTO business_preferences(
+                            user_id,interval_seconds,last_dm_at,onboarding_sent
+                        ) VALUES(?,?,NULL,1)
+                    """, (b["user_id"], 3600))
+                    interval = 3600
+                    last_dm = None
+                else:
+                    interval = int(pref["interval_seconds"] or 0)
+                    last_dm = parse_time(pref["last_dm_at"])
+
+                # Queue exactly one notification for this interval. The
+                # timestamp is claimed in the same transaction as the payout.
+                should_notify = (
+                    interval > 0 and
+                    (last_dm is None or (now - last_dm).total_seconds() >= interval)
+                )
+                if should_notify:
+                    conn.execute("""
+                        INSERT INTO business_notifications(
+                            payout_id,user_id,business_name,gross_amount,tax_amount,
+                            net_amount,hours,created_at,next_attempt_at
+                        ) VALUES(?,?,?,?,?,?,?,?,?)
+                    """, (
+                        payout_id, b["user_id"], b["business_name"], gross, tax,
+                        net, hours, now.isoformat(), now.isoformat()
+                    ))
+                    conn.execute(
+                        "UPDATE business_preferences SET last_dm_at=? WHERE user_id=?",
+                        (now.isoformat(), b["user_id"])
+                    )
+                    notifications_created += 1
+
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        return notifications_created
+    finally:
+        conn.close()
+
+
+async def pay_businesses():
+    """Run the blocking economy calculation in a worker thread."""
+    try:
+        return await asyncio.to_thread(_pay_businesses_sync)
+    except Exception:
+        # Caller logs the exception; never let one bad business kill the loop.
+        raise
+
+
+def _get_pending_business_notifications(limit=10):
+    now = datetime.now(timezone.utc).isoformat()
+    conn = db()
+    try:
+        rows = conn.execute("""
+            SELECT *
+            FROM business_notifications
+            WHERE sent_at IS NULL
+              AND (next_attempt_at IS NULL OR next_attempt_at<=?)
+            ORDER BY notification_id
+            LIMIT ?
+        """, (now, int(limit))).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def _mark_business_notification_result(notification_id, success, error_text=None):
+    conn = db()
+    try:
+        if success:
+            conn.execute("""
+                UPDATE business_notifications
+                SET sent_at=?, last_error=NULL
+                WHERE notification_id=? AND sent_at IS NULL
+            """, (datetime.now(timezone.utc).isoformat(), notification_id))
+        else:
+            row = conn.execute(
+                "SELECT attempts FROM business_notifications WHERE notification_id=?",
+                (notification_id,)
+            ).fetchone()
+            attempts = int(row["attempts"] if row else 0) + 1
+            delay = min(
+                BUSINESS_DM_RETRY_MAX_SECONDS,
+                BUSINESS_DM_RETRY_BASE_SECONDS * (2 ** min(attempts - 1, 6))
+            )
+            next_try = datetime.now(timezone.utc) + timedelta(seconds=delay)
+            conn.execute("""
+                UPDATE business_notifications
+                SET attempts=?, last_error=?, next_attempt_at=?
+                WHERE notification_id=? AND sent_at IS NULL
+            """, (
+                attempts, str(error_text or "unknown error")[:1000],
+                next_try.isoformat(), notification_id
+            ))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+async def process_business_notification_queue():
+    """Reliably deliver queued business DMs with retry/backoff."""
+    rows = await asyncio.to_thread(
+        _get_pending_business_notifications, BUSINESS_DM_BATCH_SIZE
+    )
+    for row in rows:
+        try:
+            ok = await safe_dm(
+                row["user_id"],
+                embed_obj=embed(
+                    "🏢 Прибуток бізнесу",
+                    f"**{row['business_name']}** приніс **{money(row['gross_amount'])} грн.** "
+                    f"за {row['hours']} год.\n\n"
+                    f"🏛️ У казну: **{money(row['tax_amount'])} грн.**\n"
+                    f"💰 Тобі: **{money(row['net_amount'])} грн.**",
+                    discord.Color.green()
+                ),
+                retries=3
+            )
+            await asyncio.to_thread(
+                _mark_business_notification_result,
+                row["notification_id"], ok,
+                None if ok else "Discord DM failed"
+            )
+            if not ok:
+                print(
+                    f"[BUSINESS DM] delivery failed: user={row['user_id']} "
+                    f"notification={row['notification_id']} attempts={row['attempts'] + 1}"
+                )
+        except Exception as exc:
+            print(
+                f"[BUSINESS DM] queue item error: "
+                f"user={row['user_id']} notification={row['notification_id']}: {exc!r}"
+            )
+            try:
+                await asyncio.to_thread(
+                    _mark_business_notification_result,
+                    row["notification_id"], False, repr(exc)
+                )
+            except Exception as mark_exc:
+                print(f"[BUSINESS DM] failed to persist retry state: {mark_exc!r}")
 
 async def process_political_state():
     now=datetime.now(timezone.utc)
@@ -3643,16 +3891,48 @@ async def process_political_state():
     if not active and (not last or (now-last).total_seconds()>=ELECTION_INTERVAL): await start_election("weekly")
 
 async def economy_loop():
-    await asyncio.sleep(10)
+    """Long-running economy worker with independent stages.
+
+    A failure in one stage is isolated. The loop also runs frequently enough
+    that hourly payouts/notifications are not dependent on a fragile 5-minute
+    timing boundary.
+    """
+    await asyncio.sleep(3)
     while not bot.is_closed():
+        cycle_started = time.monotonic()
         try:
-            await pay_businesses()
-            await process_garages()
-            await process_loans()
-            await process_political_state()
+            try:
+                await pay_businesses()
+            except Exception as exc:
+                print(f"[ECONOMY] business payout error: {exc!r}")
+
+            try:
+                await process_business_notification_queue()
+            except Exception as exc:
+                print(f"[ECONOMY] business DM queue error: {exc!r}")
+
+            try:
+                await process_garages()
+            except Exception as exc:
+                print(f"[ECONOMY] garage error: {exc!r}")
+
+            try:
+                await process_loans()
+            except Exception as exc:
+                print(f"[ECONOMY] loan error: {exc!r}")
+
+            try:
+                await process_political_state()
+            except Exception as exc:
+                print(f"[ECONOMY] political-state error: {exc!r}")
+
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
-            print(f"[ECONOMY] loop error: {exc!r}")
-        await asyncio.sleep(GARAGE_CHECK_INTERVAL)
+            print(f"[ECONOMY] unexpected loop error: {exc!r}")
+
+        elapsed = time.monotonic() - cycle_started
+        await asyncio.sleep(max(1, ECONOMY_LOOP_SECONDS - elapsed))
 
 class BusinessView(discord.ui.View):
     def __init__(self, owner_id):
@@ -3760,17 +4040,6 @@ async def send_business_preference(user_id, force=False):
     conn.commit(); conn.close()
     await safe_dm(user_id, content="🏢 У тебе є бізнес! Обери, як часто повідомляти про прибуток:", view=BusinessPreferenceView(user_id))
 
-async def maybe_send_business_profit_dm(user_id,business_name,gross,tax,net,hours):
-    conn=db(); row=conn.execute("SELECT * FROM business_preferences WHERE user_id=?",(user_id,)).fetchone()
-    if not row:
-        conn.execute("INSERT INTO business_preferences(user_id,interval_seconds,onboarding_sent) VALUES(?,?,1)",(user_id,3600)); conn.commit(); row=conn.execute("SELECT * FROM business_preferences WHERE user_id=?",(user_id,)).fetchone()
-    interval=int(row["interval_seconds"] or 0); last=parse_time(row["last_dm_at"]); now=datetime.now(timezone.utc)
-    should=interval>0 and (not last or (now-last).total_seconds()>=interval)
-    if should:
-        conn.execute("UPDATE business_preferences SET last_dm_at=? WHERE user_id=?",(now.isoformat(),user_id)); conn.commit()
-    conn.close()
-    if should:
-        await safe_dm(user_id,embed_obj=embed("🏢 Прибуток бізнесу",f"**{business_name}** приніс **{money(gross)} грн.** за {hours} год.\n\n🏛️ У казну: **{money(tax)} грн.**\n💰 Тобі: **{money(net)} грн.**",discord.Color.green()))
 
 class BusinessPreferenceView(discord.ui.View):
     def __init__(self, owner_id): super().__init__(timeout=86400); self.owner_id=owner_id
@@ -5101,6 +5370,30 @@ async def promo_create(interaction: discord.Interaction, code: str, money_amount
     await log_admin_action(interaction, f"Створив промокод **{code}**: +**{money(money_amount)} грн**, {dick_amount:+d} см.")
     await interaction.response.send_message(f"Промокод {code} створено. +{money(money_amount)}, {dick_amount:+d} см.", ephemeral=True)
 
+# ---------------- GLOBAL ERROR / HEALTH HANDLERS ----------------
+
+@bot.event
+async def on_error(event_method, *args, **kwargs):
+    """Never allow an event exception to silently kill a Discord event path."""
+    import traceback
+    print(f"[EVENT ERROR] method={event_method!r}")
+    traceback.print_exc()
+
+@bot.event
+async def on_command_error(ctx, error):
+    """Prefix-command safety net for commands that fail before responding."""
+    original = getattr(error, "original", error)
+    print(
+        f"[PREFIX ERROR] command={getattr(ctx.command, 'qualified_name', 'unknown')} "
+        f"user={getattr(ctx.author, 'id', 'unknown')}: {original!r}"
+    )
+    if getattr(ctx, "interaction", None):
+        return
+    try:
+        await ctx.send("❌ Під час виконання команди сталася помилка. Спробуй ще раз.")
+    except Exception as exc:
+        print(f"[PREFIX ERROR RESPONSE FAILED] {exc!r}")
+
 # ---------------- SLASH COMMAND ERROR HANDLER ----------------
 
 @bot.tree.error
@@ -5111,10 +5404,12 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
     # Validation errors are normally handled by Discord before callback execution.
     # For unexpected runtime errors, log the full exception and give the user a
     # short, non-sensitive message instead of leaving the interaction hanging.
+    import traceback
     print(
         f"[SLASH ERROR] command={getattr(interaction.command, 'qualified_name', 'unknown')} "
         f"user={getattr(interaction.user, 'id', 'unknown')}: {original!r}"
     )
+    traceback.print_exception(type(original), original, original.__traceback__)
 
     message = "❌ Під час виконання команди сталася помилка. Спробуй ще раз."
     if isinstance(error, app_commands.CheckFailure):
@@ -5140,11 +5435,19 @@ async def on_ready():
     init_db()
     await resume_masturbation_sessions()
     try:
-        conn = db(); existing_business_users = {r["user_id"] for r in conn.execute("SELECT DISTINCT user_id FROM businesses").fetchall()}; conn.close()
+        conn = db()
+        existing_business_users = {
+            r["user_id"]
+            for r in conn.execute("SELECT DISTINCT user_id FROM businesses").fetchall()
+        }
+        conn.close()
+        # Do not block on dozens of Discord DMs during on_ready. Queue each
+        # onboarding notification as a background task so command sync remains
+        # responsive immediately after reconnect/restart.
         for uid in existing_business_users:
-            await send_business_preference(uid)
+            asyncio.create_task(send_business_preference(uid))
     except Exception as exc:
-        print(f"[BUSINESS DM] startup notification error: {exc!r}")
+        print(f"[BUSINESS DM] startup notification scheduling error: {exc!r}")
     if _economy_task is None or _economy_task.done():
         _economy_task = asyncio.create_task(economy_loop())
     if _backup_task is None or _backup_task.done():
