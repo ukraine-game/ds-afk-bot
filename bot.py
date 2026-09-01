@@ -297,6 +297,7 @@ def _migrate_schema(conn):
             "stamina": "INTEGER NOT NULL DEFAULT 0",
             "level": "INTEGER NOT NULL DEFAULT 1",
             "successful_commands": "INTEGER NOT NULL DEFAULT 0",
+            "robbery_at": "TEXT",
         },
         "businesses": {
             "last_paid_at": "TEXT NOT NULL DEFAULT ''",
@@ -3954,20 +3955,62 @@ async def ukraine(interaction):
     if current_president()!=interaction.user.id: return await interaction.response.send_message("❌ Ти не президент.",ephemeral=True)
     await interaction.response.send_message(embed=embed("🇺🇦 Україна",f"Президент: <@{interaction.user.id}>\n🏛️ Казна: **{money(get_treasury())} грн.**\n📊 Податок бізнесу: **{int(get_state('business_tax',5))}%**",discord.Color.gold()),view=UkraineView(interaction.user.id),ephemeral=True)
 
+ROBBERY_COOLDOWN_SECONDS = 2 * 60 * 60
+ROBBERY_MIN_BALANCE_RATIO = 0.15
+
 @bot.tree.command(name="robbery",description="50/50 пограбувати іншого гравця")
 @app_commands.describe(user="Кого пограбувати")
 async def robbery(interaction,user:discord.Member):
     if not normal_channel_only(interaction): return await reject_wrong_channel(interaction)
-    if user.bot or user.id==interaction.user.id: return await interaction.response.send_message("❌ Обери іншого гравця.",ephemeral=True)
-    victim=get_user(user.id); robber=get_user(interaction.user.id)
+    if user.bot or user.id==interaction.user.id:
+        return await interaction.response.send_message("❌ Обери іншого гравця.",ephemeral=True)
+
+    victim=get_user(user.id)
+    robber=get_user(interaction.user.id)
+    robber_balance=int(robber["balance"] or 0)
+    victim_balance=int(victim["balance"] or 0)
+
+    if victim_balance <= 0:
+        return await interaction.response.send_message("❌ У цього гравця немає грошей для пограбування.",ephemeral=True)
+
+    required_balance=max(1, int(victim_balance * ROBBERY_MIN_BALANCE_RATIO))
+    if robber_balance < required_balance:
+        return await interaction.response.send_message(
+            f"❌ Для пограбування потрібно мати щонайменше **15%** від балансу жертви.\n"
+            f"💰 У жертви: **{money(victim_balance)} грн.**\n"
+            f"💳 Тобі потрібно: **{money(required_balance)} грн.**, а в тебе **{money(robber_balance)} грн.**.",
+            ephemeral=True,
+        )
+
+    # Cooldown is persisted in SQLite, so restarting the bot does not reset it.
+    now=datetime.now(timezone.utc)
+    last_raw=robber["robbery_at"]
+    if last_raw:
+        try:
+            last=datetime.fromisoformat(str(last_raw).replace("Z","+00:00"))
+            if last.tzinfo is None: last=last.replace(tzinfo=timezone.utc)
+            remaining=ROBBERY_COOLDOWN_SECONDS-(now-last).total_seconds()
+            if remaining>0:
+                hours=int(remaining//3600); minutes=int((remaining%3600)//60); seconds=int(remaining%60)
+                return await interaction.response.send_message(
+                    f"⏳ Пограбування ще на кулдауні. Спробуй через **{hours} год. {minutes} хв. {seconds} сек.**.",
+                    ephemeral=True,
+                )
+        except (ValueError,TypeError):
+            pass
+
+    conn=db()
+    conn.execute("UPDATE users SET robbery_at=? WHERE user_id=?",(now.isoformat(),interaction.user.id))
+    conn.commit(); conn.close()
+
     if random.random()<0.5:
-        amount=int(victim["balance"])
+        amount=victim_balance
         if amount>0:
             money_add(user.id,-amount); money_add(interaction.user.id,amount)
         register_successful_command(interaction.user.id)
         await interaction.response.send_message(f"💰 {interaction.user.mention} повністю пограбував {user.mention} і забрав **{money(amount)} грн.**!")
     else:
-        lost=int(robber["balance"])
+        lost=robber_balance
         if lost>0:
             money_add(interaction.user.id,-lost); add_treasury(lost)
         register_successful_command(interaction.user.id)
