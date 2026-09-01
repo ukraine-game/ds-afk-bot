@@ -3154,18 +3154,24 @@ async def guess_command(interaction: discord.Interaction, number: app_commands.R
 
 @bot.event
 async def on_message(message: discord.Message):
-    if message.author.bot: return
+    if message.author.bot:
+        return
 
-    # Cookie game scoring must remain active even though this is the final on_message handler.
+    # Never run SQLite directly from on_message. This handler fires for every
+    # Discord message, so a slow filesystem/SQLite operation here can freeze
+    # the entire asyncio event loop and make unrelated slash commands/buttons
+    # show "This interaction failed".
     cookie_game = cookie_games.get(message.channel.id)
     if cookie_game and cookie_game["status"] == "playing" and message.author.id in cookie_game["scores"]:
         cookie_game["scores"][message.author.id] += len(message.content)
-        conn = db()
-        conn.execute("UPDATE cookie_games SET proposer_score=?, opponent_score=? WHERE channel_id=?",
-                     (cookie_game["scores"][cookie_game["proposer_id"]], cookie_game["scores"][cookie_game["opponent_id"]], cookie_game["channel_id"]))
-        conn.commit(); conn.close()
+        await asyncio.to_thread(
+            _save_cookie_scores_sync,
+            cookie_game["channel_id"],
+            cookie_game["scores"][cookie_game["proposer_id"]],
+            cookie_game["scores"][cookie_game["opponent_id"]],
+        )
 
-    conn = db(); row = conn.execute("SELECT * FROM number_games WHERE channel_id=? AND status='playing'", (message.channel.id,)).fetchone(); conn.close()
+    row = await asyncio.to_thread(_get_active_number_game_sync, message.channel.id)
     if row and message.content.strip().isdigit():
         try: await message.delete()
         except discord.HTTPException: pass
@@ -3177,6 +3183,30 @@ async def on_message(message: discord.Message):
         except discord.HTTPException: pass
         return
     await bot.process_commands(message)
+
+def _save_cookie_scores_sync(channel_id: int, proposer_score: int, opponent_score: int) -> None:
+    conn = db()
+    try:
+        conn.execute(
+            "UPDATE cookie_games SET proposer_score=?, opponent_score=? WHERE channel_id=?",
+            (proposer_score, opponent_score, channel_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _get_active_number_game_sync(channel_id: int):
+    conn = db()
+    try:
+        row = conn.execute(
+            "SELECT * FROM number_games WHERE channel_id=? AND status='playing'",
+            (channel_id,),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
 
 # ---------------- MASTURBATION ----------------
 async def finish_masturbation_session(session_id: int):
@@ -4032,33 +4062,154 @@ def business_embed(user_id):
     tax=int(get_state("business_tax",5))
     return embed("📊 Статистика бізнесу", "\n\n".join(lines)+f"\n\n🏛️ До казни зараз йде **{tax}%** прибутку бізнесів.", discord.Color.gold())
 
+# Persistent business-preference buttons.
+# IMPORTANT: Discord component interactions sent from an old message can arrive
+# after a bot restart. A normal View stored only in RAM then produces
+# "This interaction failed / AFK BOT не відповідає у заданий час".
+# These buttons have stable custom_ids and timeout=None, and are re-registered
+# for every business owner on every on_ready.
+_business_pref_registered: set[int] = set()
+
+
+def _set_business_preference_sync(user_id: int, seconds: int) -> None:
+    conn = db()
+    try:
+        conn.execute(
+            """INSERT INTO business_preferences(user_id,interval_seconds,onboarding_sent)
+               VALUES(?,?,1)
+               ON CONFLICT(user_id) DO UPDATE SET interval_seconds=?, onboarding_sent=1""",
+            (user_id, seconds, seconds),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 async def send_business_preference(user_id, force=False):
-    conn=db(); row=conn.execute("SELECT * FROM business_preferences WHERE user_id=?",(user_id,)).fetchone()
+    # All SQLite work is off the Discord event loop. This is critical because
+    # an interaction must be acknowledged within Discord's short deadline.
+    row = await asyncio.to_thread(_get_business_preference_row, user_id)
     if row and row["onboarding_sent"] and not force:
-        conn.close(); return
-    conn.execute("INSERT INTO business_preferences(user_id,interval_seconds,onboarding_sent) VALUES(?,?,1) ON CONFLICT(user_id) DO UPDATE SET onboarding_sent=1",(user_id,3600))
-    conn.commit(); conn.close()
-    await safe_dm(user_id, content="🏢 У тебе є бізнес! Обери, як часто повідомляти про прибуток:", view=BusinessPreferenceView(user_id))
+        return
+
+    await asyncio.to_thread(_set_business_onboarding_sent, user_id)
+    view = BusinessPreferenceView(user_id)
+    # Register immediately as well as on startup. timeout=None makes the view
+    # persistent and prevents it from dying after 24 hours.
+    _register_business_preference_view(view)
+    ok = await safe_dm(
+        user_id,
+        content="🏢 У тебе є бізнес! Обери, як часто повідомляти про прибуток:",
+        view=view,
+    )
+    if not ok:
+        print(f"[BUSINESS PREF] failed to send preference menu to user={user_id}; it will be retried on next startup/check")
+
+
+def _get_business_preference_row(user_id: int):
+    conn = db()
+    try:
+        row = conn.execute("SELECT * FROM business_preferences WHERE user_id=?", (user_id,)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def _set_business_onboarding_sent(user_id: int) -> None:
+    conn = db()
+    try:
+        conn.execute(
+            """INSERT INTO business_preferences(user_id,interval_seconds,onboarding_sent)
+               VALUES(?,?,1)
+               ON CONFLICT(user_id) DO UPDATE SET onboarding_sent=1""",
+            (user_id, 3600),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _register_business_preference_view(view: "BusinessPreferenceView") -> None:
+    owner_id = view.owner_id
+    if owner_id in _business_pref_registered:
+        return
+    try:
+        bot.add_view(view)
+        _business_pref_registered.add(owner_id)
+    except (ValueError, RuntimeError) as exc:
+        # Duplicate registration is harmless; keep startup resilient.
+        print(f"[BUSINESS PREF] view registration warning for user={owner_id}: {exc!r}")
 
 
 class BusinessPreferenceView(discord.ui.View):
-    def __init__(self, owner_id): super().__init__(timeout=86400); self.owner_id=owner_id
-    async def interaction_check(self,interaction):
-        if interaction.user.id!=self.owner_id: await interaction.response.send_message("❌ Це меню належить іншому гравцю.",ephemeral=True); return False
+    def __init__(self, owner_id: int):
+        super().__init__(timeout=None)
+        self.owner_id = int(owner_id)
+        self._add_button("Раз в 1 год.", discord.ButtonStyle.primary, 3600, "раз в 1 годину")
+        self._add_button("Раз в 2 год.", discord.ButtonStyle.primary, 7200, "раз в 2 години")
+        self._add_button("Раз в 5 год.", discord.ButtonStyle.primary, 18000, "раз в 5 годин")
+        self._add_button("Раз в день", discord.ButtonStyle.primary, 86400, "раз в день")
+        self._add_button("Ніколи", discord.ButtonStyle.secondary, 0, "ніколи")
+
+    def _add_button(self, label: str, style: discord.ButtonStyle, seconds: int, text: str):
+        button = discord.ui.Button(
+            label=label,
+            style=style,
+            custom_id=f"business_pref:{self.owner_id}:{seconds}",
+        )
+
+        async def callback(interaction: discord.Interaction):
+            await self.choose(interaction, seconds, text)
+
+        button.callback = callback
+        self.add_item(button)
+
+    async def interaction_check(self, interaction: discord.Interaction):
+        if interaction.user.id != self.owner_id:
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "❌ Це меню належить іншому гравцю.", ephemeral=True
+                )
+            return False
         return True
-    async def choose(self,interaction,seconds,label):
-        conn=db(); conn.execute("INSERT INTO business_preferences(user_id,interval_seconds,onboarding_sent) VALUES(?,?,1) ON CONFLICT(user_id) DO UPDATE SET interval_seconds=?,onboarding_sent=1",(self.owner_id,seconds,seconds)); conn.commit(); conn.close()
-        await interaction.response.edit_message(content=f"✅ Повідомлення про прибуток: **{label}**.",view=None)
-    @discord.ui.button(label="Раз в 1 год.",style=discord.ButtonStyle.primary)
-    async def h1(self,i,b): await self.choose(i,3600,"раз в 1 годину")
-    @discord.ui.button(label="Раз в 2 год.",style=discord.ButtonStyle.primary)
-    async def h2(self,i,b): await self.choose(i,7200,"раз в 2 години")
-    @discord.ui.button(label="Раз в 5 год.",style=discord.ButtonStyle.primary)
-    async def h5(self,i,b): await self.choose(i,18000,"раз в 5 годин")
-    @discord.ui.button(label="Раз в день",style=discord.ButtonStyle.primary)
-    async def day(self,i,b): await self.choose(i,86400,"раз в день")
-    @discord.ui.button(label="Ніколи",style=discord.ButtonStyle.secondary)
-    async def never(self,i,b): await self.choose(i,0,"ніколи")
+
+    async def choose(self, interaction: discord.Interaction, seconds: int, label: str):
+        # ACK FIRST. Never perform SQLite/network work before Discord receives
+        # the interaction acknowledgement. This directly fixes intermittent
+        # "AFK BOT не відповідає у заданий час" component failures.
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.defer()
+        except discord.HTTPException as exc:
+            print(f"[BUSINESS PREF] defer failed user={interaction.user.id}: {exc!r}")
+            return
+
+        try:
+            await asyncio.to_thread(_set_business_preference_sync, self.owner_id, int(seconds))
+            await interaction.edit_original_response(
+                content=f"✅ Повідомлення про прибуток: **{label}**.",
+                view=None,
+            )
+        except sqlite3.Error as exc:
+            print(f"[BUSINESS PREF] database error user={self.owner_id}: {exc!r}")
+            try:
+                await interaction.edit_original_response(
+                    content="❌ Не вдалося зберегти налаштування. Спробуй натиснути кнопку ще раз.",
+                    view=self,
+                )
+            except Exception as response_exc:
+                print(f"[BUSINESS PREF] DB error response failed: {response_exc!r}")
+        except discord.HTTPException as exc:
+            print(f"[BUSINESS PREF] Discord response error user={self.owner_id}: {exc!r}")
+        except Exception as exc:
+            print(f"[BUSINESS PREF] unexpected error user={self.owner_id}: {exc!r}")
+            try:
+                await interaction.edit_original_response(
+                    content="❌ Сталася тимчасова помилка. Спробуй ще раз.",
+                    view=self,
+                )
+            except Exception as response_exc:
+                print(f"[BUSINESS PREF] fallback response failed: {response_exc!r}")
 
 class BizShareModal(discord.ui.Modal,title="Поділитися бізнесом"):
     user_id=discord.ui.TextInput(label="Discord ID гравця",placeholder="123456789012345678")
@@ -5441,10 +5592,12 @@ async def on_ready():
             for r in conn.execute("SELECT DISTINCT user_id FROM businesses").fetchall()
         }
         conn.close()
-        # Do not block on dozens of Discord DMs during on_ready. Queue each
-        # onboarding notification as a background task so command sync remains
-        # responsive immediately after reconnect/restart.
+        # Re-register persistent component views after every reconnect/restart.
+        # This is what makes buttons from already-sent DM messages continue to
+        # work instead of showing Discord's "This interaction failed" message.
         for uid in existing_business_users:
+            _register_business_preference_view(BusinessPreferenceView(uid))
+            # Only send onboarding when the DB says it has not been sent.
             asyncio.create_task(send_business_preference(uid))
     except Exception as exc:
         print(f"[BUSINESS DM] startup notification scheduling error: {exc!r}")
