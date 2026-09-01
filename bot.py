@@ -4020,6 +4020,79 @@ class BusinessView(discord.ui.View):
         asyncio.create_task(log_purchase(f"Гравець **{interaction.user}** (<@{interaction.user.id}>) купив бізнес **{name}** за **{money(price)} грн.**. Прибуток: **+{money(hourly)} грн./год.**"))
 
 
+# ---------------- BUSINESS MANUAL RESEND ----------------
+
+def _get_latest_business_notification_sync(user_id: int):
+    conn = db()
+    try:
+        row = conn.execute("""
+            SELECT * FROM business_notifications
+            WHERE user_id=?
+            ORDER BY notification_id DESC
+            LIMIT 1
+        """, (int(user_id),)).fetchone()
+        if row:
+            return dict(row)
+        # If no notification was ever queued, fall back to the latest payout.
+        row = conn.execute("""
+            SELECT p.*, b.business_name
+            FROM business_payouts p
+            JOIN businesses b ON b.business_id=p.business_id
+            WHERE p.user_id=?
+            ORDER BY p.payout_id DESC
+            LIMIT 1
+        """, (int(user_id),)).fetchone()
+        if not row:
+            return None
+        r=dict(row)
+        return {
+            "notification_id": None,
+            "user_id": int(user_id),
+            "business_name": r["business_name"],
+            "gross_amount": int(r["gross_amount"]),
+            "tax_amount": int(r["tax_amount"]),
+            "net_amount": int(r["net_amount"]),
+            "hours": int(r.get("hours") or 1),
+        }
+    finally:
+        conn.close()
+
+
+def _get_business_preference_for_imp_sync(user_id: int):
+    conn=db()
+    try:
+        row=conn.execute("SELECT interval_seconds FROM business_preferences WHERE user_id=?",(int(user_id),)).fetchone()
+        return int(row["interval_seconds"]) if row else 0
+    finally:
+        conn.close()
+
+
+@bot.command(name="imp")
+async def imp(message: discord.Message):
+    """Manually resend the latest business-profit DM to the command author."""
+    if message.author.bot:
+        return
+    row = await asyncio.to_thread(_get_latest_business_notification_sync, message.author.id)
+    if not row:
+        return await message.reply("❌ У тебе ще немає жодного нарахованого прибутку бізнесу.", mention_author=False)
+
+    profit_embed = embed(
+        "🏢 Прибуток бізнесу",
+        f"**{row['business_name']}** приніс **{money(row['gross_amount'])} грн.** за {row['hours']} год.\n\n"
+        f"🏛️ У казну: **{money(row['tax_amount'])} грн.**\n"
+        f"💰 Тобі: **{money(row['net_amount'])} грн.**\n\n"
+        "🔁 Повторно надіслано командою `!imp`.",
+        discord.Color.green()
+    )
+    ok = await safe_dm(message.author.id, embed_obj=profit_embed, retries=5)
+    if ok:
+        await message.reply("✅ Останнє повідомлення про прибуток повторно надіслано тобі в ЛС.", mention_author=False)
+    else:
+        await message.reply(
+            "❌ Не вдалося надіслати ЛС. Перевір, чи дозволені особисті повідомлення від цього сервера/бота, і спробуй `!imp` ще раз.",
+            mention_author=False
+        )
+
 # ---------------- BUSINESS STATS / NOTIFICATIONS ----------------
 BUSINESS_NOTIFICATION_OPTIONS = [("1 год.",3600),("2 год.",7200),("5 год.",18000),("1 день",86400),("Ніколи",0)]
 
@@ -4092,7 +4165,8 @@ async def send_business_preference(user_id, force=False):
     if row and row["onboarding_sent"] and not force:
         return
 
-    await asyncio.to_thread(_set_business_onboarding_sent, user_id)
+    # IMPORTANT: do not mark onboarding as sent before Discord confirms the DM.
+    # If Discord rejects/blocks the DM, the next retry/startup must be allowed to resend it.
     view = BusinessPreferenceView(user_id)
     # Register immediately as well as on startup. timeout=None makes the view
     # persistent and prevents it from dying after 24 hours.
@@ -4102,8 +4176,10 @@ async def send_business_preference(user_id, force=False):
         content="🏢 У тебе є бізнес! Обери, як часто повідомляти про прибуток:",
         view=view,
     )
-    if not ok:
-        print(f"[BUSINESS PREF] failed to send preference menu to user={user_id}; it will be retried on next startup/check")
+    if ok:
+        await asyncio.to_thread(_set_business_onboarding_sent, user_id)
+    else:
+        print(f"[BUSINESS PREF] failed to send preference menu to user={user_id}; onboarding remains unsent for retry")
 
 
 def _get_business_preference_row(user_id: int):
@@ -4178,24 +4254,23 @@ class BusinessPreferenceView(discord.ui.View):
         # the interaction acknowledgement. This directly fixes intermittent
         # "AFK BOT не відповідає у заданий час" component failures.
         try:
+            # Send the ACK before doing ANY database work. This is deliberately
+            # the first awaited operation in the callback.
             if not interaction.response.is_done():
-                await interaction.response.defer()
+                await interaction.response.send_message(
+                    f"✅ Повідомлення про прибуток: **{label}**.", ephemeral=True
+                )
         except discord.HTTPException as exc:
-            print(f"[BUSINESS PREF] defer failed user={interaction.user.id}: {exc!r}")
+            print(f"[BUSINESS PREF] initial response failed user={interaction.user.id}: {exc!r}")
             return
 
         try:
             await asyncio.to_thread(_set_business_preference_sync, self.owner_id, int(seconds))
-            await interaction.edit_original_response(
-                content=f"✅ Повідомлення про прибуток: **{label}**.",
-                view=None,
-            )
         except sqlite3.Error as exc:
             print(f"[BUSINESS PREF] database error user={self.owner_id}: {exc!r}")
             try:
-                await interaction.edit_original_response(
-                    content="❌ Не вдалося зберегти налаштування. Спробуй натиснути кнопку ще раз.",
-                    view=self,
+                await interaction.followup.send(
+                    "❌ Налаштування не вдалося зберегти. Спробуй натиснути кнопку ще раз.", ephemeral=True
                 )
             except Exception as response_exc:
                 print(f"[BUSINESS PREF] DB error response failed: {response_exc!r}")
@@ -5576,6 +5651,19 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
     except discord.HTTPException as exc:
         print(f"[SLASH ERROR RESPONSE FAILED] {exc!r}")
 
+# ---------------- EVENT LOOP HEALTH WATCHDOG ----------------
+async def event_loop_watchdog():
+    """Detect event-loop stalls that can cause Discord's 3-second interaction timeout."""
+    interval = 1.0
+    expected = time.monotonic() + interval
+    while not bot.is_closed():
+        await asyncio.sleep(interval)
+        now = time.monotonic()
+        lag = now - expected
+        expected = now + interval
+        if lag >= 1.0:
+            print(f"[WATCHDOG] Discord event loop was delayed by {lag:.2f}s")
+
 # ---------------- START ----------------
 
 _economy_task: Optional[asyncio.Task] = None
@@ -5605,6 +5693,10 @@ async def on_ready():
         _economy_task = asyncio.create_task(economy_loop())
     if _backup_task is None or _backup_task.done():
         _backup_task = asyncio.create_task(backup_loop())
+    # Keep a permanent event-loop health monitor. A stall is logged with its
+    # exact duration so intermittent Discord interaction failures are diagnosable.
+    if not any(t.get_name() == "event_loop_watchdog" for t in asyncio.all_tasks()):
+        asyncio.create_task(event_loop_watchdog(), name="event_loop_watchdog")
     try:
         health = await asyncio.to_thread(database_health)
         print(f"[DB] Health: {health}")
