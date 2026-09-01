@@ -4022,76 +4022,83 @@ class BusinessView(discord.ui.View):
 
 # ---------------- BUSINESS MANUAL RESEND ----------------
 
-def _get_latest_business_notification_sync(user_id: int):
-    conn = db()
-    try:
-        row = conn.execute("""
-            SELECT * FROM business_notifications
-            WHERE user_id=?
-            ORDER BY notification_id DESC
-            LIMIT 1
-        """, (int(user_id),)).fetchone()
-        if row:
-            return dict(row)
-        # If no notification was ever queued, fall back to the latest payout.
-        row = conn.execute("""
-            SELECT p.*, b.business_name
-            FROM business_payouts p
-            JOIN businesses b ON b.business_id=p.business_id
-            WHERE p.user_id=?
-            ORDER BY p.payout_id DESC
-            LIMIT 1
-        """, (int(user_id),)).fetchone()
-        if not row:
-            return None
-        r=dict(row)
-        return {
-            "notification_id": None,
-            "user_id": int(user_id),
-            "business_name": r["business_name"],
-            "gross_amount": int(r["gross_amount"]),
-            "tax_amount": int(r["tax_amount"]),
-            "net_amount": int(r["net_amount"]),
-            "hours": int(r.get("hours") or 1),
-        }
-    finally:
-        conn.close()
+async def resend_business_preference_menu(user_id: int) -> bool:
+    """Send a fresh business notification-frequency menu.
 
-
-def _get_business_preference_for_imp_sync(user_id: int):
-    conn=db()
+    This is deliberately independent from onboarding_sent. It is a recovery
+    path for an old Discord message whose buttons may have become invalid or
+    whose interaction was not acknowledged after a bot restart/reconnect.
+    """
     try:
-        row=conn.execute("SELECT interval_seconds FROM business_preferences WHERE user_id=?",(int(user_id),)).fetchone()
-        return int(row["interval_seconds"]) if row else 0
-    finally:
-        conn.close()
+        view = BusinessPreferenceView(int(user_id))
+        # Register BEFORE sending the message. If Discord delivers a component
+        # interaction immediately, the callback is already known to the bot.
+        _register_business_preference_view(view)
+        return await safe_dm(
+            int(user_id),
+            content=(
+                "🏢 **У тебе є бізнес!**\n\n"
+                "Обери, як часто повідомляти тобі про прибуток:\n"
+                "\n"
+                "Якщо попереднє меню не реагувало на кнопки — це нове меню, "
+                "його можна використовувати замість старого."
+            ),
+            view=view,
+            retries=5,
+        )
+    except Exception as exc:
+        print(f"[BUSINESS PREF] manual resend failed user={user_id}: {exc!r}")
+        return False
 
 
 @bot.command(name="imp")
 async def imp(message: discord.Message):
-    """Manually resend the latest business-profit DM to the command author."""
+    """Recovery command: send a fresh business-frequency button menu in DM."""
     if message.author.bot:
         return
-    row = await asyncio.to_thread(_get_latest_business_notification_sync, message.author.id)
-    if not row:
-        return await message.reply("❌ У тебе ще немає жодного нарахованого прибутку бізнесу.", mention_author=False)
 
-    profit_embed = embed(
-        "🏢 Прибуток бізнесу",
-        f"**{row['business_name']}** приніс **{money(row['gross_amount'])} грн.** за {row['hours']} год.\n\n"
-        f"🏛️ У казну: **{money(row['tax_amount'])} грн.**\n"
-        f"💰 Тобі: **{money(row['net_amount'])} грн.**\n\n"
-        "🔁 Повторно надіслано командою `!imp`.",
-        discord.Color.green()
-    )
-    ok = await safe_dm(message.author.id, embed_obj=profit_embed, retries=5)
+    # !imp is intentionally a recovery command for the FREQUENCY MENU, not
+    # for a profit payout. This fixes the case where the old message says
+    # "AFK BOT не відповідає у заданий час" when a button is clicked.
+    try:
+        has_business = await asyncio.to_thread(_user_has_business_sync, message.author.id)
+    except Exception as exc:
+        print(f"[IMP] business lookup failed user={message.author.id}: {exc!r}")
+        return await message.reply(
+            "❌ Не вдалося перевірити бізнес. Спробуй `!imp` ще раз через кілька секунд.",
+            mention_author=False,
+        )
+
+    if not has_business:
+        return await message.reply(
+            "❌ У тебе немає бізнесу, тому меню вибору частоти повідомлень недоступне.",
+            mention_author=False,
+        )
+
+    ok = await resend_business_preference_menu(message.author.id)
     if ok:
-        await message.reply("✅ Останнє повідомлення про прибуток повторно надіслано тобі в ЛС.", mention_author=False)
+        await message.reply(
+            "✅ Я надіслав тобі **нове меню вибору частоти повідомлень про прибуток** у ЛС.\n"
+            "Старе меню можеш більше не використовувати.",
+            mention_author=False,
+        )
     else:
         await message.reply(
-            "❌ Не вдалося надіслати ЛС. Перевір, чи дозволені особисті повідомлення від цього сервера/бота, і спробуй `!imp` ще раз.",
-            mention_author=False
+            "❌ Не вдалося надіслати нове меню в ЛС. Перевір, чи відкриті особисті повідомлення від бота, і спробуй `!imp` ще раз.",
+            mention_author=False,
         )
+
+
+def _user_has_business_sync(user_id: int) -> bool:
+    conn = db()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM businesses WHERE user_id=? LIMIT 1",
+            (int(user_id),),
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
 
 # ---------------- BUSINESS STATS / NOTIFICATIONS ----------------
 BUSINESS_NOTIFICATION_OPTIONS = [("1 год.",3600),("2 год.",7200),("5 год.",18000),("1 день",86400),("Ніколи",0)]
